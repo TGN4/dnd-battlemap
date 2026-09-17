@@ -47,6 +47,7 @@ for (const map of Object.values(state.maps)) {
   if (!map.initiative) map.initiative = defaultInitiative();
   else if (!map.initiative.traveled) map.initiative.traveled = {};
   if (!map.obstacles) map.obstacles = [];
+  if (!map.templates) map.templates = [];
 }
 
 function activeEntry(map) {
@@ -106,6 +107,7 @@ app.post('/api/maps', (req, res) => {
       scale: null, // pixels-per-foot, set by clicking two points a known distance apart
       pins: [], // { id, type: 'player'|'monster', name, color, speed, hpMax, hpCurrent, conditions, hidden, wx, wy }
       obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles, DM-only for now (see stateForConnection)
+      templates: [], // { id, shape: 'cone'|'circle'|'line', x, y, angle, length, radius, width } — visible to everyone
       initiative: defaultInitiative(),
     };
     state.activeMapId = id;
@@ -325,6 +327,37 @@ function handleMessage(conn, msg) {
       const idx = map.obstacles.findIndex(o => o.id === msg.obstacleId);
       if (idx === -1) return;
       map.obstacles.splice(idx, 1);
+      break;
+    }
+    case 'addTemplate': {
+      // DM-only to place (first pass — see the story), but visible to everyone once placed:
+      // unlike obstacles this is inherently something the whole table should see, matching
+      // how a spell's area of effect actually plays at a table.
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      const t = msg.template;
+      if (!map || !t) return;
+      if (t.shape === 'circle') {
+        if (!(t.radius > 0)) return;
+        map.templates.push({ id: t.id || crypto.randomUUID(), shape: 'circle', x: t.x, y: t.y, radius: t.radius });
+      } else if (t.shape === 'cone') {
+        if (!(t.length > 0)) return;
+        map.templates.push({ id: t.id || crypto.randomUUID(), shape: 'cone', x: t.x, y: t.y, angle: t.angle, length: t.length });
+      } else if (t.shape === 'line') {
+        if (!(t.length > 0) || !(t.width > 0)) return;
+        map.templates.push({ id: t.id || crypto.randomUUID(), shape: 'line', x: t.x, y: t.y, angle: t.angle, length: t.length, width: t.width });
+      } else {
+        return;
+      }
+      break;
+    }
+    case 'removeTemplate': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map) return;
+      const idx = map.templates.findIndex(t => t.id === msg.templateId);
+      if (idx === -1) return;
+      map.templates.splice(idx, 1);
       break;
     }
     case 'setInitiativeOrder': {

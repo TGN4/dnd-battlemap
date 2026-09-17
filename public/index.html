@@ -17,6 +17,7 @@
     --monster: #e5484d;
     --measure: #f5a623;
     --obstacle: #a78bfa;
+    --template: #38bdf8;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -69,6 +70,9 @@
   body.player-mode #dpLink,
   body.player-mode #btnInitiative,
   body.player-mode #btnObstacles,
+  body.player-mode #btnAoeCone,
+  body.player-mode #btnAoeCircle,
+  body.player-mode #btnAoeLine,
   body.player-mode #btnStopCombat {
     display: none !important;
   }
@@ -103,6 +107,12 @@
   #mapCanvas { position: absolute; left: 0; top: 0; display: block; }
 
   #turnRangeLayer, #rangeLayer, #measureLayer { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+  #templatesLayer, #templatePreview { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+  #templatesLayer .aoe-shape { pointer-events: auto; cursor: pointer; fill: var(--template); fill-opacity: .22; stroke: var(--template); stroke-width: 2; }
+  #templatesLayer .aoe-remove { pointer-events: auto; cursor: pointer; }
+  #templatesLayer .aoe-remove circle { fill: #20222c; stroke: var(--border); }
+  #templatesLayer .aoe-remove text { fill: #fff; font-size: 11px; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+  #templatePreview .aoe-shape { fill: var(--template); fill-opacity: .18; stroke: var(--template); stroke-width: 2; stroke-dasharray: 4 3; }
 
   #pinsLayer { position: absolute; left: 0; top: 0; }
   .pin {
@@ -410,6 +420,9 @@
   <button id="btnAddMonster" disabled>+ Monster</button>
   <button id="btnMeasure" disabled>Measure</button>
   <button id="btnObstacles" disabled>Solid areas</button>
+  <button id="btnAoeCone" disabled>Cone</button>
+  <button id="btnAoeCircle" disabled>Circle</button>
+  <button id="btnAoeLine" disabled>Line</button>
   <button id="btnInitiative" disabled>Initiative</button>
   <div class="sep"></div>
   <button id="btnResetView" disabled>Reset view</button>
@@ -422,6 +435,8 @@
     <canvas id="mapCanvas"></canvas>
     <div id="obstaclesLayer"></div>
     <div id="obstaclePreview" class="hidden"></div>
+    <svg id="templatesLayer"></svg>
+    <svg id="templatePreview" class="hidden"></svg>
     <svg id="turnRangeLayer"></svg>
     <svg id="rangeLayer"></svg>
     <svg id="measureLayer"></svg>
@@ -572,6 +587,8 @@ const pinsLayer   = document.getElementById('pinsLayer');
 const measureLayer= document.getElementById('measureLayer');
 const obstaclesLayer=document.getElementById('obstaclesLayer');
 const obstaclePreview=document.getElementById('obstaclePreview');
+const templatesLayer = document.getElementById('templatesLayer');
+const templatePreview = document.getElementById('templatePreview');
 const placeholder = document.getElementById('placeholder');
 const statusEl    = document.getElementById('status');
 const fileInput   = document.getElementById('fileInput');
@@ -585,6 +602,9 @@ const btnAddPlayer= document.getElementById('btnAddPlayer');
 const btnAddMonster=document.getElementById('btnAddMonster');
 const btnMeasure  = document.getElementById('btnMeasure');
 const btnObstacles= document.getElementById('btnObstacles');
+const btnAoeCone  = document.getElementById('btnAoeCone');
+const btnAoeCircle= document.getElementById('btnAoeCircle');
+const btnAoeLine  = document.getElementById('btnAoeLine');
 const btnInitiative=document.getElementById('btnInitiative');
 const btnResetView= document.getElementById('btnResetView');
 
@@ -818,6 +838,7 @@ function applyRemoteState(newState) {
     pins = m?.pins || [];
     renderAllPins();
     renderObstacles();
+    renderTemplates();
     populateMapSelect();
     updateToolbarState();
     renderTurnOrder();
@@ -1299,13 +1320,16 @@ function applyWorldTransform() { world.style.transform = `translate(${panX}px, $
 function setMode(next) {
   mode = next;
   stage.className = 'mode-' + mode;
-  [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnObstacles].forEach(b => b.classList.remove('active'));
+  [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnObstacles, btnAoeCone, btnAoeCircle, btnAoeLine].forEach(b => b.classList.remove('active'));
   if (mode === 'set-scale') btnSetScale.classList.add('active');
   if (mode === 'pan') btnPan.classList.add('active');
   if (mode === 'add-player') btnAddPlayer.classList.add('active');
   if (mode === 'add-monster') btnAddMonster.classList.add('active');
   if (mode === 'measure') btnMeasure.classList.add('active');
   if (mode === 'obstacles') btnObstacles.classList.add('active');
+  if (mode === 'aoe-cone') btnAoeCone.classList.add('active');
+  if (mode === 'aoe-circle') btnAoeCircle.classList.add('active');
+  if (mode === 'aoe-line') btnAoeLine.classList.add('active');
   clearMeasurement();
   hideDistancePanel();
   const mine = myRole === 'player' ? 'your' : 'a';
@@ -1317,6 +1341,9 @@ function setMode(next) {
     'add-monster': 'Click on the map to place a monster pin.',
     'measure': 'Click a start point, then an end point, to measure the distance.',
     'obstacles': 'Drag to mark a solid area (walls, rocks, etc). Click an existing one to remove it. Only you can see these for now.',
+    'aoe-cone': 'Drag from the origin to aim and size a cone. Click an existing one to remove it.',
+    'aoe-circle': 'Drag from the center to size a circle. Click an existing one to remove it.',
+    'aoe-line': 'Drag to aim and size a 5ft-wide line. Click an existing one to remove it.',
   };
   statusEl.textContent = hints[mode] || '';
 }
@@ -1340,6 +1367,9 @@ function updateToolbarState() {
   btnAddMonster.disabled = !hasScale;
   btnMeasure.disabled = !hasScale;
   btnObstacles.disabled = !hasScale;
+  btnAoeCone.disabled = !hasScale;
+  btnAoeCircle.disabled = !hasScale;
+  btnAoeLine.disabled = !hasScale;
   btnResetView.disabled = !hasScale;
   btnDeleteMap.disabled = !hasMap;
   btnInitiative.disabled = !hasScale;
@@ -1378,6 +1408,7 @@ async function loadActiveMap() {
     pins = [];
     renderAllPins();
     renderObstacles();
+    renderTemplates();
     setMode('no-map');
     updateToolbarState();
     renderTurnOrder();
@@ -1388,6 +1419,7 @@ async function loadActiveMap() {
   applyWorldTransform();
   renderAllPins();
   renderObstacles();
+  renderTemplates();
   try {
     await renderPdf(`/uploads/${m.file}?t=${Date.now()}`);
   } catch (err) {
@@ -1564,6 +1596,75 @@ function commitObstacle(x1, y1, x2, y2) {
   sendAction({ type: 'addObstacle', mapId: m.id, obstacle });
 }
 
+// ── AoE spell-area templates (cone/circle/line) — visible to everyone, DM places for now ──
+const CONE_HALF_ANGLE = Math.atan(0.5); // ~26.57° — matches 5e's "width at distance d equals d" cone rule
+const LINE_WIDTH_FT = 5; // fixed for a first pass — see the story
+function templateShapePoints(shape, x, y, angle, length, radius, width) {
+  if (shape === 'circle') return { tag: 'circle', attrs: `cx="${x}" cy="${y}" r="${radius}"` };
+  if (shape === 'cone') {
+    const a1 = angle - CONE_HALF_ANGLE, a2 = angle + CONE_HALF_ANGLE;
+    const x1 = x + length * Math.cos(a1), y1 = y + length * Math.sin(a1);
+    const x2 = x + length * Math.cos(a2), y2 = y + length * Math.sin(a2);
+    return { tag: 'polygon', attrs: `points="${x},${y} ${x1},${y1} ${x2},${y2}"` };
+  }
+  // line
+  const px = -Math.sin(angle) * width / 2, py = Math.cos(angle) * width / 2;
+  const fx = x + length * Math.cos(angle), fy = y + length * Math.sin(angle);
+  const pts = [[x + px, y + py], [x - px, y - py], [fx - px, fy - py], [fx + px, fy + py]];
+  return { tag: 'polygon', attrs: `points="${pts.map(p => p.join(',')).join(' ')}"` };
+}
+function renderTemplates() {
+  const list = activeMap()?.templates || [];
+  templatesLayer.innerHTML = list.map(t => {
+    const { tag, attrs } = templateShapePoints(t.shape, t.x, t.y, t.angle, t.length, t.radius, t.width);
+    return `<g data-id="${t.id}"><${tag} class="aoe-shape" ${attrs}/><g class="aoe-remove" transform="translate(${t.x},${t.y})"><circle r="9"/><text>×</text></g></g>`;
+  }).join('');
+  templatesLayer.querySelectorAll('.aoe-remove').forEach(el => {
+    el.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const id = el.closest('[data-id]').dataset.id;
+      const ok = await askConfirm('Remove this template?');
+      if (!ok) return;
+      const m = activeMap();
+      if (!m) return;
+      m.templates = m.templates.filter(t => t.id !== id);
+      renderTemplates();
+      sendAction({ type: 'removeTemplate', mapId: m.id, templateId: id });
+    });
+  });
+}
+function drawTemplatePreview(shape, originX, originY, curX, curY) {
+  const dx = curX - originX, dy = curY - originY;
+  const length = Math.hypot(dx, dy);
+  const angle = Math.atan2(dy, dx);
+  const m = activeMap();
+  const width = (m?.scale || 20) * LINE_WIDTH_FT;
+  const { tag, attrs } = templateShapePoints(shape, originX, originY, angle, length, length, width);
+  templatePreview.innerHTML = `<${tag} class="aoe-shape" ${attrs}/>`;
+  templatePreview.classList.remove('hidden');
+}
+function clearTemplatePreview() {
+  templatePreview.classList.add('hidden');
+  templatePreview.innerHTML = '';
+}
+function commitTemplateFromDrag(shape, originX, originY, curX, curY) {
+  const dx = curX - originX, dy = curY - originY;
+  const length = Math.hypot(dx, dy);
+  if (length < 8) return; // accidental click/jitter filter, matching obstacles
+  const angle = Math.atan2(dy, dx);
+  const m = activeMap();
+  if (!m) return;
+  let template;
+  if (shape === 'circle') template = { id: crypto.randomUUID(), shape, x: originX, y: originY, radius: length };
+  else if (shape === 'cone') template = { id: crypto.randomUUID(), shape, x: originX, y: originY, angle, length };
+  else if (shape === 'line') template = { id: crypto.randomUUID(), shape, x: originX, y: originY, angle, length, width: (m.scale || 20) * LINE_WIDTH_FT };
+  else return;
+  if (!m.templates) m.templates = [];
+  m.templates.push(template);
+  renderTemplates();
+  sendAction({ type: 'addTemplate', mapId: m.id, template });
+}
+
 // ── measuring / point-picking (shared by Measure and Set scale) ─────
 function clearMeasurement() {
   pendingPoint = null;
@@ -1594,6 +1695,7 @@ function drawMeasureLine(p1, p2) {
 // ── stage interaction (drag to pan, click to act, pinch to zoom) ─────
 let dragState = null;
 let obstacleDragState = null; // separate from dragState: a drag in 'obstacles' mode draws a rectangle instead of panning
+let templateDragState = null; // same idea, for the three 'aoe-*' modes
 // Two simultaneous pointers on the stage background (not started on a pin) means a touch
 // pinch/pan gesture — tracked separately from the single-pointer drag/click path above,
 // since mouse wheel already owns zoom for non-touch input.
@@ -1637,6 +1739,13 @@ stage.addEventListener('pointerdown', (e) => {
     obstacleDragState = { startWorldX: worldX, startWorldY: worldY, moved: false };
     return;
   }
+  if (mode.startsWith('aoe-') && myRole === 'dm' && !e.target.closest('.aoe-shape, .aoe-remove')) {
+    const rect = stage.getBoundingClientRect();
+    const worldX = ((e.clientX - rect.left) - panX) / zoom;
+    const worldY = ((e.clientY - rect.top) - panY) / zoom;
+    templateDragState = { shape: mode.slice(4), startWorldX: worldX, startWorldY: worldY };
+    return;
+  }
   dragState = { startX: e.clientX, startY: e.clientY, moved: false, origPanX: panX, origPanY: panY };
 });
 
@@ -1648,6 +1757,13 @@ stage.addEventListener('pointermove', (e) => {
     const worldX = ((e.clientX - rect.left) - panX) / zoom;
     const worldY = ((e.clientY - rect.top) - panY) / zoom;
     drawObstaclePreview(obstacleDragState.startWorldX, obstacleDragState.startWorldY, worldX, worldY);
+    return;
+  }
+  if (templateDragState) {
+    const rect = stage.getBoundingClientRect();
+    const worldX = ((e.clientX - rect.left) - panX) / zoom;
+    const worldY = ((e.clientY - rect.top) - panY) / zoom;
+    drawTemplatePreview(templateDragState.shape, templateDragState.startWorldX, templateDragState.startWorldY, worldX, worldY);
     return;
   }
 
@@ -1693,6 +1809,16 @@ stage.addEventListener('pointerup', (e) => {
     clearObstaclePreview();
     return;
   }
+  if (templateDragState) {
+    const rect = stage.getBoundingClientRect();
+    const worldX = ((e.clientX - rect.left) - panX) / zoom;
+    const worldY = ((e.clientY - rect.top) - panY) / zoom;
+    safeRelease(stage, e.pointerId);
+    commitTemplateFromDrag(templateDragState.shape, templateDragState.startWorldX, templateDragState.startWorldY, worldX, worldY);
+    templateDragState = null;
+    clearTemplatePreview();
+    return;
+  }
   if (!dragState) return;
   const moved = dragState.moved;
   safeRelease(stage, e.pointerId);
@@ -1704,6 +1830,8 @@ stage.addEventListener('pointerup', (e) => {
 stage.addEventListener('pointercancel', (e) => {
   obstacleDragState = null;
   clearObstaclePreview();
+  templateDragState = null;
+  clearTemplatePreview();
   endTouch(e.pointerId);
   dragState = null;
 });
@@ -1820,6 +1948,9 @@ btnAddPlayer.addEventListener('click', () => setMode('add-player'));
 btnAddMonster.addEventListener('click', () => setMode('add-monster'));
 btnMeasure.addEventListener('click', () => setMode('measure'));
 btnObstacles.addEventListener('click', () => setMode('obstacles'));
+btnAoeCone.addEventListener('click', () => setMode('aoe-cone'));
+btnAoeCircle.addEventListener('click', () => setMode('aoe-circle'));
+btnAoeLine.addEventListener('click', () => setMode('aoe-line'));
 btnResetView.addEventListener('click', () => {
   panX = 0; panY = 0; zoom = 1;
   applyWorldTransform();
