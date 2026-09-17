@@ -1,0 +1,416 @@
+const express = require('express');
+const multer  = require('multer');
+const path    = require('path');
+const fs      = require('fs');
+const crypto  = require('crypto');
+const http    = require('http');
+const { WebSocketServer } = require('ws');
+
+const dataDir    = path.join(__dirname, 'data');
+const uploadsDir = path.join(dataDir, 'uploads');
+const statePath  = path.join(dataDir, 'battlemap-data.json');
+
+fs.mkdirSync(uploadsDir, { recursive: true });
+
+const defaultState = {
+  activeMapId: null,
+  maps: {}, // id -> { id, name, file, scale, pins }
+};
+
+function loadState() {
+  try { return { ...defaultState, ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
+  catch { return { ...defaultState, maps: {} }; }
+}
+
+function saveState() {
+  fs.writeFileSync(statePath, JSON.stringify(state, null, 2));
+}
+
+// Single in-memory authoritative copy — both REST handlers and websocket actions
+// mutate this directly (never re-read from disk mid-request), then persist + broadcast.
+let state = loadState();
+
+function defaultInitiative() {
+  // order: [{ id, pinIds: [pinId,...] }] — more than one pinId means a DM-grouped entry
+  // (e.g. "3 goblins") that acts as one turn. traveled tracks each active pin's cumulative
+  // movement distance (px) so far this turn, so a player can move, act (e.g. cast a spell),
+  // then move again and still be held to one total speed's worth of movement — movePin clamps
+  // each new drag against the remaining budget rather than giving it a fresh one.
+  return { order: [], active: false, currentIndex: 0, round: 1, traveled: {} };
+}
+// Existing maps saved before this feature existed won't have `initiative` on disk; maps saved
+// by an earlier build of this feature have `initiative` but not yet `traveled`.
+for (const map of Object.values(state.maps)) {
+  if (!map.initiative) map.initiative = defaultInitiative();
+  else if (!map.initiative.traveled) map.initiative.traveled = {};
+  if (!map.obstacles) map.obstacles = [];
+}
+
+function activeEntry(map) {
+  const init = map.initiative;
+  if (!init || !init.active) return null;
+  return init.order[init.currentIndex] || null;
+}
+
+function resetTraveled(map, entry) {
+  if (!entry) return;
+  for (const pinId of entry.pinIds) map.initiative.traveled[pinId] = 0;
+}
+
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: uploadsDir,
+    filename: (req, _file, cb) => {
+      const id = crypto.randomUUID();
+      req.mapId = id;
+      cb(null, `${id}.pdf`);
+    },
+  }),
+  fileFilter: (_req, file, cb) => {
+    if (file.mimetype !== 'application/pdf') return cb(new Error('Only PDF files are supported.'));
+    cb(null, true);
+  },
+  limits: { fileSize: 100 * 1024 * 1024 },
+});
+
+const app = express();
+app.use(express.json());
+app.get('/play/:pinId', (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
+app.use(express.static(path.join(__dirname, 'public')));
+app.use('/uploads', express.static(uploadsDir));
+app.use('/vendor/pdfjs', express.static(path.join(__dirname, 'node_modules/pdfjs-dist/build')));
+
+app.get('/api/state', (_req, res) => {
+  res.json(state);
+});
+
+app.post('/api/maps', (req, res) => {
+  upload.single('map')(req, res, (err) => {
+    if (err) {
+      const message = err.code === 'LIMIT_FILE_SIZE' ? 'PDF is too large (max 100MB).' : (err.message || 'Import failed.');
+      return res.status(400).json({ error: message });
+    }
+    if (!req.file) return res.status(400).json({ error: 'No file was uploaded.' });
+
+    const id = req.mapId;
+    const name = (req.body.name || req.file.originalname || 'Map').toString().trim().slice(0, 80) || 'Map';
+    state.maps[id] = {
+      id,
+      name,
+      file: `${id}.pdf`,
+      scale: null, // pixels-per-foot, set by clicking two points a known distance apart
+      pins: [], // { id, type: 'player'|'monster', name, speed, hpMax, hpCurrent, hidden, wx, wy }
+      obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles, DM-only for now (see stateForConnection)
+      initiative: defaultInitiative(),
+    };
+    state.activeMapId = id;
+    saveState();
+    broadcastState();
+    res.json(state);
+  });
+});
+
+app.delete('/api/maps/:id', (req, res) => {
+  const map = state.maps[req.params.id];
+  if (!map) return res.status(404).json({ error: 'Map not found.' });
+
+  try { fs.unlinkSync(path.join(uploadsDir, map.file)); } catch {}
+  delete state.maps[req.params.id];
+
+  if (state.activeMapId === req.params.id) {
+    const remaining = Object.keys(state.maps);
+    state.activeMapId = remaining[0] || null;
+  }
+  saveState();
+  broadcastState();
+  res.json(state);
+});
+
+// ── line of sight ─────────────────────────────────────────────────────
+// Each obstacle rectangle blocks sight along its 4 edges; two points have LOS
+// if the segment between them crosses none of those edges, for any obstacle.
+function segmentsIntersect(p1, p2, p3, p4) {
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const d1 = cross(p3, p4, p1), d2 = cross(p3, p4, p2);
+  const d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+function hasLOS(a, b, obstacles) {
+  const pa = { x: a.wx, y: a.wy }, pb = { x: b.wx, y: b.wy };
+  for (const o of obstacles) {
+    const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
+    for (let i = 0; i < 4; i++) {
+      if (segmentsIntersect(pa, pb, c[i], c[(i + 1) % 4])) return false;
+    }
+  }
+  return true;
+}
+
+// ── realtime layer ────────────────────────────────────────────────────
+// Every connection is either the DM (full control) or a player linked to one
+// pin id (can only move/adjust-HP on that pin). This split is what lets
+// stateForConnection() below filter what's broadcast to whom without any
+// further data-model changes: pins already carry a `hidden` flag (unused
+// today, always false) for a future fog-of-war feature to use the same way.
+const clients = new Set(); // { ws, role: 'dm'|'player', pinId: string|null }
+
+function stateForConnection(conn) {
+  if (conn.role !== 'player') return state;
+  const maps = {};
+  for (const [id, map] of Object.entries(state.maps)) {
+    // Obstacle markings themselves are a DM-only authoring layer — a player never sees the
+    // rectangles, only their effect (below). A monster pin is only sent to a player at all if
+    // SOME player pin has line of sight to it (shared party vision: once the party can see a
+    // monster, everyone in the party knows it's there). Separately, each monster pin sent
+    // carries `losFromMe`: whether THIS player's own pin specifically has a clear line to it —
+    // shared vision can reveal a monster's existence without this player being able to target
+    // it themselves (e.g. a teammate down the hall spots it around a corner this player can't
+    // see past), and that distinction has to be visible in the UI for targeting decisions.
+    const playerPins = map.pins.filter(p => p.type === 'player');
+    const myPin = map.pins.find(p => p.id === conn.pinId);
+    const pins = map.pins
+      .filter(p => p.type !== 'monster' || playerPins.some(pp => hasLOS(pp, p, map.obstacles)))
+      .map(p => p.type !== 'monster' ? p : { ...p, losFromMe: !!myPin && hasLOS(myPin, p, map.obstacles) });
+    maps[id] = { ...map, obstacles: [], pins };
+  }
+  return { ...state, maps };
+}
+
+function send(conn, msg) {
+  if (conn.ws.readyState === conn.ws.OPEN) conn.ws.send(JSON.stringify(msg));
+}
+
+function broadcastState() {
+  // Every connection gets every update, including the sender of the action that caused it.
+  // A websocket-originated change already applies itself locally/optimistically on the
+  // sender's own client for responsiveness, but the sender still needs this confirmation:
+  // without it, a sender's own pending edit that happens to diverge from what the server
+  // actually applied (e.g. a differently-timed broadcast from another client landing in
+  // between) can never self-correct, since the sender would otherwise never hear back at
+  // all. index.html guards the one place this used to cause a problem — two concurrent
+  // loadActiveMap()/renderPdf() calls racing on a map switch — with a generation counter
+  // instead of relying on the sender never seeing its own confirmation.
+  for (const conn of clients) {
+    send(conn, { type: 'state', state: stateForConnection(conn) });
+  }
+}
+
+function findPin(mapId, pinId) {
+  const map = state.maps[mapId];
+  const pin = map?.pins.find(p => p.id === pinId);
+  return { map, pin };
+}
+
+function handleMessage(conn, msg) {
+  switch (msg.type) {
+    case 'hello': {
+      conn.role = msg.role === 'player' ? 'player' : 'dm';
+      conn.pinId = conn.role === 'player' ? msg.pinId : null;
+      send(conn, { type: 'state', state: stateForConnection(conn) });
+      return;
+    }
+    case 'addPin': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map || !msg.pin) return;
+      map.pins.push(msg.pin);
+      break;
+    }
+    case 'removePin': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map) return;
+      const idx = map.pins.findIndex(p => p.id === msg.pinId);
+      if (idx === -1) return;
+      map.pins.splice(idx, 1);
+
+      if (map.initiative) {
+        const init = map.initiative;
+        init.order.forEach(entry => { entry.pinIds = entry.pinIds.filter(id => id !== msg.pinId); });
+        init.order = init.order.filter(entry => entry.pinIds.length > 0);
+        delete init.traveled[msg.pinId];
+        if (init.active) {
+          if (!init.order.length) {
+            init.active = false;
+            init.currentIndex = 0;
+            init.round = 1;
+            init.traveled = {};
+          } else {
+            if (init.currentIndex >= init.order.length) { init.currentIndex = 0; init.round += 1; }
+            resetTraveled(map, init.order[init.currentIndex]);
+          }
+        }
+      }
+      break;
+    }
+    case 'movePin': {
+      const map = state.maps[msg.mapId];
+      const { pin } = findPin(msg.mapId, msg.pinId);
+      if (!map || !pin) return;
+
+      const entry = activeEntry(map);
+      const isActiveTurn = !!entry && entry.pinIds.includes(msg.pinId);
+
+      if (conn.role === 'player') {
+        if (conn.pinId !== msg.pinId) return; // only ever your own pin
+        if (map.initiative?.active && !isActiveTurn) return; // and only on your own turn once combat has started
+      }
+
+      let wx = msg.wx, wy = msg.wy;
+      if (isActiveTurn && pin.speed && map.scale) {
+        // Clamp against the REMAINING budget (total speed minus what's already been moved
+        // this turn), anchored to the pin's current position — not a fresh speed's worth
+        // measured from wherever the turn began — so a move → action → move again sequence
+        // is held to one total speed, however many separate drags it's split across.
+        const maxTotal = pin.speed * map.scale;
+        const traveled = map.initiative.traveled[pin.id] || 0;
+        const remaining = Math.max(0, maxTotal - traveled);
+        const dx = wx - pin.wx, dy = wy - pin.wy;
+        const dist = Math.hypot(dx, dy);
+        if (dist > remaining && dist > 0) {
+          const ratio = remaining / dist;
+          wx = pin.wx + dx * ratio;
+          wy = pin.wy + dy * ratio;
+        }
+        map.initiative.traveled[pin.id] = traveled + Math.hypot(wx - pin.wx, wy - pin.wy);
+      }
+      pin.wx = wx;
+      pin.wy = wy;
+      break;
+    }
+    case 'editPin': {
+      const { pin } = findPin(msg.mapId, msg.pinId);
+      if (!pin || !msg.patch) return;
+      const keys = Object.keys(msg.patch);
+      if (conn.role === 'player') {
+        // players may only touch their own pin, and only its current HP
+        if (conn.pinId !== msg.pinId) return;
+        if (!keys.every(k => k === 'hpCurrent')) return;
+      }
+      Object.assign(pin, msg.patch);
+      break;
+    }
+    case 'setScale': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map) return;
+      map.scale = msg.scale;
+      break;
+    }
+    case 'addObstacle': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      const o = msg.obstacle;
+      if (!map || !o || !(o.w > 0) || !(o.h > 0)) return;
+      map.obstacles.push({ id: o.id || crypto.randomUUID(), x: o.x, y: o.y, w: o.w, h: o.h });
+      break;
+    }
+    case 'removeObstacle': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map) return;
+      const idx = map.obstacles.findIndex(o => o.id === msg.obstacleId);
+      if (idx === -1) return;
+      map.obstacles.splice(idx, 1);
+      break;
+    }
+    case 'setInitiativeOrder': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map || !Array.isArray(msg.order)) return;
+      const validIds = new Set(map.pins.map(p => p.id));
+      const order = msg.order
+        .map(entry => ({ id: entry.id || crypto.randomUUID(), pinIds: (entry.pinIds || []).filter(id => validIds.has(id)) }))
+        .filter(entry => entry.pinIds.length > 0);
+
+      if (!map.initiative) map.initiative = defaultInitiative();
+      const init = map.initiative;
+      if (init.active) {
+        // Allowed mid-fight too (a latecomer joining, or reordering) — re-anchor whose
+        // turn it is by the entry's id, which is stable across a reorder, rather than
+        // its index, which isn't.
+        const activeId = init.order[init.currentIndex]?.id;
+        const newIndex = order.findIndex(e => e.id === activeId);
+        if (newIndex !== -1) {
+          init.currentIndex = newIndex;
+        } else if (order.length) {
+          // the active entry itself was removed from the order — carry on with whichever
+          // entry now sits at that position, same wrap/round-advance rule as endTurn
+          if (init.currentIndex >= order.length) { init.currentIndex = 0; init.round += 1; }
+          resetTraveled(map, order[init.currentIndex]);
+        } else {
+          init.active = false;
+          init.currentIndex = 0;
+          init.round = 1;
+          init.traveled = {};
+        }
+      }
+      init.order = order;
+      break;
+    }
+    case 'startCombat': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map || !map.initiative?.order?.length) return;
+      map.initiative.active = true;
+      map.initiative.currentIndex = 0;
+      map.initiative.round = 1;
+      map.initiative.traveled = {};
+      resetTraveled(map, map.initiative.order[0]);
+      break;
+    }
+    case 'endTurn': {
+      const map = state.maps[msg.mapId];
+      if (!map || !map.initiative?.active) return;
+      const entry = map.initiative.order[map.initiative.currentIndex];
+      const isMyTurn = entry && conn.role === 'player' && entry.pinIds.includes(conn.pinId);
+      if (conn.role !== 'dm' && !isMyTurn) return;
+
+      const order = map.initiative.order;
+      let next = map.initiative.currentIndex + 1;
+      if (next >= order.length) { next = 0; map.initiative.round += 1; }
+      map.initiative.currentIndex = next;
+      resetTraveled(map, order[next]);
+      break;
+    }
+    case 'stopCombat': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map || !map.initiative) return;
+      map.initiative.active = false;
+      map.initiative.currentIndex = 0;
+      map.initiative.round = 1;
+      map.initiative.traveled = {};
+      break;
+    }
+    case 'switchMap': {
+      if (conn.role !== 'dm') return;
+      if (msg.activeMapId !== null && !state.maps[msg.activeMapId]) return;
+      state.activeMapId = msg.activeMapId;
+      break;
+    }
+    default:
+      return;
+  }
+  saveState();
+  broadcastState();
+}
+
+const server = http.createServer(app);
+const wss = new WebSocketServer({ server, path: '/ws' });
+
+wss.on('connection', (ws) => {
+  const conn = { ws, role: null, pinId: null };
+  clients.add(conn);
+  ws.on('message', (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    handleMessage(conn, msg);
+  });
+  ws.on('close', () => clients.delete(conn));
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`DnD Battlemap running at http://localhost:${PORT}`));

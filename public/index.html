@@ -1,0 +1,1700 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>DnD Battlemap</title>
+<style>
+  :root {
+    --bg: #0f1117;
+    --panel: #171a23;
+    --border: #2a2e3a;
+    --text: #e6e8ef;
+    --muted: #8b90a0;
+    --accent: #5b6af5;
+    --accent-hover: #6f7cf7;
+    --player: #3ecf6a;
+    --monster: #e5484d;
+    --measure: #f5a623;
+    --obstacle: #a78bfa;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    overflow: hidden;
+  }
+
+  #toolbar {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 14px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+  }
+  #toolbar h1 { font-size: 15px; font-weight: 600; margin: 0 10px 0 0; white-space: nowrap; }
+  .sep { width: 1px; align-self: stretch; background: var(--border); margin: 0 2px; }
+
+  button, select {
+    background: #232636;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 7px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button:hover:not(:disabled) { background: #2b2f42; }
+  button:disabled, select:disabled { opacity: .4; cursor: not-allowed; }
+  button.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { background: #3a1f22; border-color: #5c2b30; color: #ff9797; }
+  button.danger:hover { background: #4a2529; }
+  .hidden { display: none !important; }
+
+  /* Player links hide DM-only controls — same underlying page, reduced UI. */
+  body.player-mode #mapSelect,
+  body.player-mode #btnImport,
+  body.player-mode #btnDeleteMap,
+  body.player-mode #btnSetScale,
+  body.player-mode #btnAddPlayer,
+  body.player-mode #btnAddMonster,
+  body.player-mode #dpEdit,
+  body.player-mode #dpLink,
+  body.player-mode #btnInitiative,
+  body.player-mode #btnObstacles,
+  body.player-mode #btnStopCombat {
+    display: none !important;
+  }
+
+  #mapSelect { max-width: 160px; }
+  #btnDeleteMap { padding: 7px 10px; }
+
+  #status { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
+
+  #stage {
+    position: relative;
+    flex: 1;
+    overflow: hidden;
+    background:
+      linear-gradient(45deg, #171923 25%, transparent 25%) -10px 0/20px 20px,
+      linear-gradient(-45deg, #171923 25%, transparent 25%) -10px 0/20px 20px,
+      #1b1e29;
+    touch-action: none;
+    cursor: default;
+  }
+  #stage.mode-pan { cursor: grab; }
+  #stage.mode-pan:active { cursor: grabbing; }
+  #stage.mode-add-player, #stage.mode-add-monster, #stage.mode-measure, #stage.mode-set-scale { cursor: crosshair; }
+
+  #placeholder {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: var(--muted); font-size: 15px;
+  }
+
+  #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+  #mapCanvas { position: absolute; left: 0; top: 0; display: block; }
+
+  #turnRangeLayer, #rangeLayer, #measureLayer { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+
+  #pinsLayer { position: absolute; left: 0; top: 0; }
+  .pin {
+    position: absolute;
+    transform: translate(-50%, -50%);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    user-select: none;
+  }
+  #stage.mode-pan .pin.pin-draggable { cursor: grab; }
+  #stage.mode-pan .pin.pin-draggable:active { cursor: grabbing; }
+  .pin-dot {
+    width: 34px; height: 34px;
+    border-radius: 50%;
+    border: 2px solid #fff;
+    box-shadow: 0 1px 5px rgba(0,0,0,.6);
+  }
+  .pin-player .pin-dot { background: var(--player); }
+  .pin-monster .pin-dot { background: var(--monster); }
+  .pin.pin-mine .pin-dot { box-shadow: 0 0 0 3px var(--accent), 0 1px 5px rgba(0,0,0,.6); }
+  /* Revealed by party vision, but this viewer's own pin doesn't have a personal line to it —
+     dimmed and explicitly tagged so it reads as "known to be there" rather than "targetable". */
+  .pin-no-los .pin-dot { opacity: .4; }
+  .pin-no-los .pin-label { opacity: .7; }
+  .pin-no-los-tag {
+    color: var(--measure); font-weight: 700; text-transform: uppercase; font-size: 9px;
+    letter-spacing: .03em;
+  }
+  .pin-label {
+    margin-top: 3px;
+    font-size: 11px;
+    background: rgba(0,0,0,.72);
+    color: #fff;
+    padding: 1px 6px;
+    border-radius: 4px;
+    white-space: nowrap;
+    pointer-events: none;
+  }
+  .pin-remove {
+    position: absolute;
+    top: -6px; right: -6px;
+    width: 17px; height: 17px;
+    border-radius: 50%;
+    background: #20222c;
+    color: #fff;
+    border: 1px solid var(--border);
+    font-size: 11px;
+    line-height: 1;
+    padding: 0;
+    display: none;
+    cursor: pointer;
+  }
+  .pin:hover .pin-remove { display: block; }
+
+  #obstaclesLayer { position: absolute; left: 0; top: 0; }
+  .obstacle-rect {
+    position: absolute;
+    background: repeating-linear-gradient(45deg, rgba(167,139,250,.28), rgba(167,139,250,.28) 6px, rgba(167,139,250,.14) 6px, rgba(167,139,250,.14) 12px);
+    border: 1.5px dashed var(--obstacle);
+    border-radius: 2px;
+  }
+  #stage.mode-obstacles .obstacle-rect { cursor: pointer; }
+  .obstacle-remove {
+    position: absolute;
+    top: -7px; right: -7px;
+    width: 17px; height: 17px;
+    border-radius: 50%;
+    background: #20222c;
+    color: #fff;
+    border: 1px solid var(--border);
+    font-size: 11px;
+    line-height: 1;
+    padding: 0;
+    display: none;
+    cursor: pointer;
+  }
+  .obstacle-rect:hover .obstacle-remove { display: block; }
+  #obstaclePreview {
+    position: absolute;
+    background: rgba(167,139,250,.18);
+    border: 1.5px dashed var(--obstacle);
+    border-radius: 2px;
+    pointer-events: none;
+  }
+
+  .measure-label {
+    font-size: 12px;
+    fill: var(--measure);
+    font-weight: 600;
+    paint-order: stroke;
+    stroke: #000;
+    stroke-width: 3px;
+  }
+
+  .modal-overlay {
+    position: fixed; inset: 0;
+    background: rgba(0,0,0,.5);
+    display: flex; align-items: center; justify-content: center;
+    z-index: 10;
+  }
+  .modal-overlay .box {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    width: 260px;
+  }
+  .modal-overlay .box h2 { font-size: 13px; font-weight: 600; margin: 0 0 10px; }
+  .modal-overlay .box p { font-size: 13px; margin: 0 0 4px; }
+  .modal-overlay input[type=text], .modal-overlay input[type=number] {
+    width: 100%; background: #232636; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 8px;
+    font-size: 13px;
+  }
+  .modal-overlay .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  .type-toggle { display: flex; gap: 6px; margin-top: 8px; }
+  .type-toggle button { flex: 1; }
+  .field-row { display: flex; gap: 12px; margin-top: 10px; }
+  .field-row > label {
+    flex: 1; display: flex; flex-direction: column; gap: 4px;
+    font-size: 12px; color: var(--muted);
+  }
+  .field-row select, .field-row input {
+    width: 100%; background: #232636; color: var(--text);
+    border: 1px solid var(--border); border-radius: 6px; padding: 6px;
+    font-size: 13px;
+  }
+  .link-btn {
+    display: block; width: 100%; margin-bottom: 10px;
+    background: none; border: 1px dashed var(--border); color: var(--muted);
+    padding: 6px; font-size: 12px; text-align: center;
+  }
+  .link-btn:hover { color: var(--text); background: #1c1f2b; }
+  .link-btn.compact { margin: 6px 0 0; }
+  .actions.actions-split { justify-content: space-between; }
+
+  .pin-hpbar {
+    width: 100%; height: 4px; margin-top: 3px;
+    background: rgba(255,255,255,.25); border-radius: 2px; overflow: hidden;
+  }
+  .pin-hpfill { height: 100%; }
+
+  #distancePanel {
+    position: fixed;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    width: 200px;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5);
+    z-index: 9;
+  }
+  #distancePanel .dp-header {
+    display: flex; align-items: flex-start; justify-content: space-between;
+    font-size: 13px; font-weight: 600; margin-bottom: 6px;
+  }
+  #distancePanel .dp-speed { font-weight: 400; font-size: 11px; color: var(--muted); margin-top: 1px; }
+  #distancePanel .dp-hp {
+    display: flex; align-items: center; gap: 5px;
+    font-weight: 400; font-size: 11px; color: var(--muted); margin-top: 3px;
+  }
+  #distancePanel .dp-hp input {
+    width: 40px; background: #232636; color: var(--text);
+    border: 1px solid var(--border); border-radius: 4px; padding: 2px 4px;
+    font-size: 11px;
+  }
+  #distancePanel .dp-actions { display: flex; gap: 4px; }
+  #distancePanel button.dp-icon {
+    background: none; border: none; color: var(--muted);
+    font-size: 13px; line-height: 1; padding: 2px 4px; cursor: pointer;
+  }
+  #distancePanel button.dp-icon:hover { color: var(--text); }
+  #distancePanel ul { list-style: none; margin: 0; padding: 0; }
+  #distancePanel li {
+    display: flex; align-items: center; gap: 6px;
+    font-size: 12px; padding: 3px 0;
+  }
+  #distancePanel li .dp-ft { margin-left: auto; color: var(--muted); }
+  #distancePanel .dp-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  #distancePanel .dp-dot.dp-player { background: var(--player); }
+  #distancePanel .dp-dot.dp-monster { background: var(--monster); }
+  #distancePanel .dp-empty { color: var(--muted); }
+
+  .primary-btn { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .primary-btn:hover:not(:disabled) { background: var(--accent-hover); }
+
+  .modal-overlay .init-box { width: min(640px, 92vw); }
+  .init-columns { display: flex; gap: 16px; margin-top: 10px; }
+  .init-col { flex: 1; min-width: 0; }
+  .init-col-title {
+    font-size: 12px; color: var(--muted); margin-bottom: 5px;
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  .init-list {
+    list-style: none; margin: 0; padding: 0; max-height: 360px; overflow-y: auto;
+    border: 1px solid var(--border); border-radius: 6px; min-height: 40px;
+  }
+  .init-list li {
+    padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px;
+    display: flex; align-items: center; gap: 6px;
+  }
+  .init-list li:last-child { border-bottom: none; }
+  .init-list label { display: flex; align-items: center; gap: 7px; cursor: pointer; flex: 1; min-width: 0; }
+  .init-dot { width: 9px; height: 9px; border-radius: 50%; flex: none; }
+  .init-dot.init-player { background: var(--player); }
+  .init-dot.init-monster { background: var(--monster); }
+  .init-entry-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .init-mini { padding: 3px 7px; font-size: 12px; }
+  .init-empty { color: var(--muted); padding: 10px; text-align: center; font-size: 12px; }
+
+  /* Turn-order entries: laid out as a card per entry (not a single-line row) so a
+     DM-grouped entry (several pins sharing one turn) is visually obvious as a cluster,
+     not just a truncated comma-separated string. */
+  #initOrderList.init-list { max-height: 400px; }
+  #initOrderList li {
+    flex-direction: column; align-items: stretch; gap: 6px; padding: 8px 10px;
+  }
+  .init-order-head { display: flex; align-items: center; gap: 6px; }
+  .init-order-turn { font-size: 11px; color: var(--muted); font-weight: 600; }
+  .init-order-controls { display: flex; gap: 4px; margin-left: auto; }
+  .init-order-members { display: flex; flex-wrap: wrap; gap: 5px; }
+  .init-chip {
+    display: flex; align-items: center; gap: 5px;
+    background: #232636; border: 1px solid var(--border); border-radius: 20px;
+    padding: 3px 9px 3px 7px; font-size: 12px;
+  }
+  #initOrderList li.init-group {
+    background: rgba(91,106,245,.08); border: 1px solid rgba(91,106,245,.35); border-radius: 6px;
+  }
+  .init-group-badge {
+    font-size: 10px; color: var(--accent); border: 1px solid rgba(91,106,245,.5);
+    border-radius: 10px; padding: 1px 6px; font-weight: 600;
+  }
+
+  #turnOrderPanel {
+    position: absolute; top: 10px; right: 10px;
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+    padding: 10px 12px; width: 220px; box-shadow: 0 4px 16px rgba(0,0,0,.5); z-index: 8;
+  }
+  #turnOrderPanel .to-header {
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 13px; font-weight: 600; margin-bottom: 6px;
+  }
+  #turnOrderPanel ul { list-style: none; margin: 0 0 8px; padding: 0; max-height: 260px; overflow-y: auto; }
+  #turnOrderPanel li {
+    display: flex; align-items: flex-start; gap: 6px; font-size: 12px;
+    padding: 4px 6px; border-radius: 4px;
+  }
+  #turnOrderPanel li.active { background: rgba(91,106,245,.25); font-weight: 600; }
+  #turnOrderPanel .turn-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin-top: 3px; }
+  #turnOrderPanel .turn-entry { min-width: 0; flex: 1; }
+  #turnOrderPanel .turn-entry-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  #turnOrderPanel .turn-moved { font-weight: 400; font-size: 10.5px; color: var(--muted); margin-top: 1px; }
+  #turnOrderPanel .turn-dot.turn-player { background: var(--player); }
+  #turnOrderPanel .turn-dot.turn-monster { background: var(--monster); }
+  #turnOrderPanel button#btnEndTurn { width: 100%; }
+
+  #toast {
+    position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%);
+    background: #3a1f22; border: 1px solid #5c2b30; color: #ffb4b4;
+    padding: 10px 16px; border-radius: 8px; font-size: 13px;
+    max-width: 360px; text-align: center; z-index: 20;
+    box-shadow: 0 4px 16px rgba(0,0,0,.5);
+  }
+</style>
+</head>
+<body>
+
+<header id="toolbar">
+  <h1>DnD Battlemap</h1>
+  <select id="mapSelect"><option value="">No maps yet</option></select>
+  <input type="file" id="fileInput" accept="application/pdf" hidden>
+  <button id="btnImport">+ New map</button>
+  <button id="btnDeleteMap" disabled title="Delete this map">🗑</button>
+  <div class="sep"></div>
+  <button id="btnSetScale" disabled>Set scale</button>
+  <button id="btnPan" disabled>Move</button>
+  <button id="btnAddPlayer" disabled>+ Player</button>
+  <button id="btnAddMonster" disabled>+ Monster</button>
+  <button id="btnMeasure" disabled>Measure</button>
+  <button id="btnObstacles" disabled>Solid areas</button>
+  <button id="btnInitiative" disabled>Initiative</button>
+  <div class="sep"></div>
+  <button id="btnResetView" disabled>Reset view</button>
+  <span id="status"></span>
+</header>
+
+<div id="stage">
+  <div id="placeholder">Import a PDF battle map to begin.</div>
+  <div id="world">
+    <canvas id="mapCanvas"></canvas>
+    <div id="obstaclesLayer"></div>
+    <div id="obstaclePreview" class="hidden"></div>
+    <svg id="turnRangeLayer"></svg>
+    <svg id="rangeLayer"></svg>
+    <svg id="measureLayer"></svg>
+    <div id="pinsLayer"></div>
+  </div>
+  <div id="turnOrderPanel" class="hidden">
+    <div class="to-header">
+      <span>Round <span id="turnRound"></span></span>
+      <button class="dp-icon" id="btnStopCombat" title="End combat">✕</button>
+    </div>
+    <ul id="turnOrderRows"></ul>
+    <button id="btnEndTurn" class="primary-btn hidden">End turn</button>
+  </div>
+</div>
+
+<div id="nameDialog" class="modal-overlay hidden">
+  <div class="box">
+    <h2 id="nameDialogTitle"></h2>
+    <input type="text" id="nameDialogInput" maxlength="80">
+    <div class="actions">
+      <button id="nameDialogCancel">Cancel</button>
+      <button id="nameDialogOk">Add</button>
+    </div>
+  </div>
+</div>
+
+<div id="scaleDialog" class="modal-overlay hidden">
+  <div class="box">
+    <h2>How many feet apart are these two points?</h2>
+    <input type="number" id="scaleDialogInput" min="0.1" step="0.5">
+    <div class="actions">
+      <button id="scaleDialogCancel">Cancel</button>
+      <button id="scaleDialogOk">Set scale</button>
+    </div>
+  </div>
+</div>
+
+<div id="pinDialog" class="modal-overlay hidden">
+  <div class="box">
+    <h2 id="pinDialogTitle">New pin</h2>
+    <input type="file" id="statblockInput" accept="application/json,.json" hidden>
+    <button type="button" id="btnImportStatblock" class="link-btn">Import stat block (.json)…</button>
+    <input type="text" id="pinDialogName" placeholder="Name" maxlength="40">
+    <div class="type-toggle">
+      <button type="button" id="pinTypePlayer">Player</button>
+      <button type="button" id="pinTypeMonster">Monster</button>
+    </div>
+    <div class="field-row">
+      <label>Size
+        <select id="pinDialogSize">
+          <option value="tiny">Tiny</option>
+          <option value="small">Small</option>
+          <option value="medium">Medium</option>
+          <option value="large">Large</option>
+          <option value="huge">Huge</option>
+          <option value="gargantuan">Gargantuan</option>
+        </select>
+      </label>
+      <label>Speed (ft/turn)
+        <input type="number" id="pinDialogSpeed" min="0" step="5">
+      </label>
+    </div>
+    <div class="field-row">
+      <label>HP current
+        <input type="number" id="pinDialogHpCurrent" min="0" placeholder="—">
+      </label>
+      <label>HP max
+        <input type="number" id="pinDialogHpMax" min="0" placeholder="—">
+      </label>
+    </div>
+    <div class="actions">
+      <button id="pinDialogCancel">Cancel</button>
+      <button id="pinDialogSave">Save</button>
+    </div>
+  </div>
+</div>
+
+<div id="initiativeDialog" class="modal-overlay hidden">
+  <div class="box init-box">
+    <h2>Initiative</h2>
+    <div class="init-columns">
+      <div class="init-col">
+        <div class="init-col-title">Available</div>
+        <ul id="initAvailableList" class="init-list"></ul>
+        <button type="button" id="btnAddToOrder" class="link-btn compact">+ Add checked to order</button>
+      </div>
+      <div class="init-col">
+        <div class="init-col-title">Turn order</div>
+        <ul id="initOrderList" class="init-list"></ul>
+      </div>
+    </div>
+    <div class="actions actions-split">
+      <button id="initDialogClose">Close</button>
+      <button id="btnStartCombat" class="primary-btn">Start Combat</button>
+    </div>
+  </div>
+</div>
+
+<div id="confirmDialog" class="modal-overlay hidden">
+  <div class="box">
+    <p id="confirmMessage"></p>
+    <div class="actions">
+      <button id="confirmCancel">Cancel</button>
+      <button id="confirmOk" class="danger">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="distancePanel" class="hidden">
+  <div class="dp-header">
+    <div>
+      <div id="dpTitle"></div>
+      <div id="dpSpeed" class="dp-speed"></div>
+      <div id="dpHpRow" class="dp-hp hidden">HP <input type="number" id="dpHpInput" min="0">/<span id="dpHpMax"></span></div>
+    </div>
+    <span class="dp-actions">
+      <button class="dp-icon" id="dpLink" title="Copy player link">🔗</button>
+      <button class="dp-icon" id="dpEdit" title="Edit">✎</button>
+      <button class="dp-icon" id="dpClose" title="Close">×</button>
+    </span>
+  </div>
+  <ul id="dpList"></ul>
+</div>
+
+<div id="toast" class="hidden"></div>
+
+<script type="module">
+import * as pdfjsLib from '/vendor/pdfjs/pdf.min.mjs';
+pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.min.mjs';
+
+// ── role: DM (default, at /) or a player linked to one pin (at /play/<pinId>) ─
+const playMatch = location.pathname.match(/^\/play\/([^/?#]+)/);
+const myRole = playMatch ? 'player' : 'dm';
+const myPinId = playMatch ? decodeURIComponent(playMatch[1]) : null;
+if (myRole === 'player') document.body.classList.add('player-mode');
+
+const stage       = document.getElementById('stage');
+const world       = document.getElementById('world');
+const mapCanvas   = document.getElementById('mapCanvas');
+const rangeLayer  = document.getElementById('rangeLayer');
+const pinsLayer   = document.getElementById('pinsLayer');
+const measureLayer= document.getElementById('measureLayer');
+const obstaclesLayer=document.getElementById('obstaclesLayer');
+const obstaclePreview=document.getElementById('obstaclePreview');
+const placeholder = document.getElementById('placeholder');
+const statusEl    = document.getElementById('status');
+const fileInput   = document.getElementById('fileInput');
+const mapSelect   = document.getElementById('mapSelect');
+
+const btnImport   = document.getElementById('btnImport');
+const btnDeleteMap= document.getElementById('btnDeleteMap');
+const btnSetScale = document.getElementById('btnSetScale');
+const btnPan      = document.getElementById('btnPan');
+const btnAddPlayer= document.getElementById('btnAddPlayer');
+const btnAddMonster=document.getElementById('btnAddMonster');
+const btnMeasure  = document.getElementById('btnMeasure');
+const btnObstacles= document.getElementById('btnObstacles');
+const btnInitiative=document.getElementById('btnInitiative');
+const btnResetView= document.getElementById('btnResetView');
+
+const turnRangeLayer = document.getElementById('turnRangeLayer');
+const turnOrderPanel = document.getElementById('turnOrderPanel');
+const turnRound        = document.getElementById('turnRound');
+const turnOrderRows     = document.getElementById('turnOrderRows');
+const btnEndTurn         = document.getElementById('btnEndTurn');
+const btnStopCombat       = document.getElementById('btnStopCombat');
+
+const initiativeDialog = document.getElementById('initiativeDialog');
+const initAvailableList= document.getElementById('initAvailableList');
+const initOrderList    = document.getElementById('initOrderList');
+const btnAddToOrder    = document.getElementById('btnAddToOrder');
+const btnStartCombat   = document.getElementById('btnStartCombat');
+const initDialogClose  = document.getElementById('initDialogClose');
+
+const nameDialog     = document.getElementById('nameDialog');
+const nameDialogTitle= document.getElementById('nameDialogTitle');
+const nameDialogInput= document.getElementById('nameDialogInput');
+const nameDialogOk   = document.getElementById('nameDialogOk');
+const nameDialogCancel = document.getElementById('nameDialogCancel');
+
+const scaleDialog     = document.getElementById('scaleDialog');
+const scaleDialogInput= document.getElementById('scaleDialogInput');
+const scaleDialogOk   = document.getElementById('scaleDialogOk');
+const scaleDialogCancel = document.getElementById('scaleDialogCancel');
+
+const pinDialog      = document.getElementById('pinDialog');
+const pinDialogTitle = document.getElementById('pinDialogTitle');
+const pinDialogName  = document.getElementById('pinDialogName');
+const pinDialogSize  = document.getElementById('pinDialogSize');
+const pinDialogSpeed = document.getElementById('pinDialogSpeed');
+const pinDialogHpCurrent = document.getElementById('pinDialogHpCurrent');
+const pinDialogHpMax = document.getElementById('pinDialogHpMax');
+const statblockInput = document.getElementById('statblockInput');
+const btnImportStatblock = document.getElementById('btnImportStatblock');
+const pinTypePlayer  = document.getElementById('pinTypePlayer');
+const pinTypeMonster = document.getElementById('pinTypeMonster');
+const pinDialogCancel= document.getElementById('pinDialogCancel');
+const pinDialogSave  = document.getElementById('pinDialogSave');
+
+const confirmDialog  = document.getElementById('confirmDialog');
+const confirmMessage = document.getElementById('confirmMessage');
+const confirmCancel  = document.getElementById('confirmCancel');
+const confirmOk      = document.getElementById('confirmOk');
+
+const distancePanel = document.getElementById('distancePanel');
+const dpTitle        = document.getElementById('dpTitle');
+const dpSpeed         = document.getElementById('dpSpeed');
+const dpHpRow           = document.getElementById('dpHpRow');
+const dpHpInput          = document.getElementById('dpHpInput');
+const dpHpMax             = document.getElementById('dpHpMax');
+const dpList           = document.getElementById('dpList');
+const dpClose           = document.getElementById('dpClose');
+const dpEdit             = document.getElementById('dpEdit');
+const dpLink              = document.getElementById('dpLink');
+
+const toast = document.getElementById('toast');
+
+const DEFAULT_SPEED = 30; // ft/turn — typical PC walking speed, editable per pin
+const DEFAULT_SIZE = 'medium';
+// D&D 5e size categories -> token diameter, ft. Large/Huge/Gargantuan match the official
+// grid space exactly (they really do span multiple squares). Small and Medium officially
+// occupy the *same* 5ft square (RAW), which makes them visually identical here since we
+// draw plain circles with no creature art — so Small is nudged down for visual distinction
+// rather than gameplay accuracy.
+const SIZE_FEET = { tiny: 2.5, small: 4, medium: 5, large: 10, huge: 15, gargantuan: 20 };
+
+let state = { activeMapId: null, maps: {} }; // last-known server state
+let pins = [];              // working copy of the active map's pins
+let mode = 'no-map';        // 'no-map' | 'set-scale' | 'pan' | 'add-player' | 'add-monster' | 'measure'
+let booted = false;         // has the first state arrived (over the websocket) yet
+
+let panX = 0, panY = 0, zoom = 1;  // view transform (world/map px -> screen) — local to this browser, never synced
+
+let pendingPoint = null;    // {x,y} first click of an in-progress measurement or scale-setting
+let currentPanelPinId = null;
+let missingPinWarned = false;
+
+// ── helpers ─────────────────────────────────────────────────────────
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+// setPointerCapture/releasePointerCapture can throw (e.g. the pointer already lifted in a
+// fast multi-touch race) — left uncaught, that aborts the rest of the handler mid-gesture.
+function safeCapture(el, id) { try { el.setPointerCapture(id); } catch {} }
+function safeRelease(el, id) { try { el.releasePointerCapture(id); } catch {} }
+function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
+function activeMap() { return state.activeMapId ? state.maps[state.activeMapId] : null; }
+function canControlPin(pin) { return myRole === 'dm' || (myRole === 'player' && myPinId === pin.id); }
+
+// ── turn-based combat helpers ──────────────────────────────────────────
+function activeEntry() {
+  const init = activeMap()?.initiative;
+  if (!init?.active) return null;
+  return init.order[init.currentIndex] || null;
+}
+function isActiveTurnPin(pin) {
+  const entry = activeEntry();
+  return !!entry && entry.pinIds.includes(pin.id);
+}
+function canDragNow(pin) {
+  if (!canControlPin(pin)) return false;
+  if (myRole !== 'player') return true; // the DM can always reposition anything, clamp aside
+  const combat = activeMap()?.initiative;
+  return !combat?.active || isActiveTurnPin(pin); // a player may only act on their own turn
+}
+// Mirrors the server's movePin clamp so a drag doesn't visibly overshoot then snap back
+// once the websocket round-trip confirms it — see the identical logic in server.js.
+// `anchor` is the pin's position when THIS drag began (not the turn's start position):
+// clamping against the remaining budget (speed minus however much was already moved
+// this turn) lets a move → action → move-again sequence still add up to one total speed.
+function clampToSpeed(pin, wx, wy, anchor) {
+  if (!isActiveTurnPin(pin)) return { wx, wy };
+  const m = activeMap();
+  if (!pin.speed || !m?.scale) return { wx, wy };
+  const maxTotal = pin.speed * m.scale;
+  const traveled = m.initiative?.traveled?.[pin.id] || 0;
+  const remaining = Math.max(0, maxTotal - traveled);
+  const dx = wx - anchor.wx, dy = wy - anchor.wy;
+  const dist = Math.hypot(dx, dy);
+  if (dist <= remaining || dist === 0) return { wx, wy };
+  const ratio = remaining / dist;
+  return { wx: anchor.wx + dx * ratio, wy: anchor.wy + dy * ratio };
+}
+function remainingSpeed(pin) {
+  const m = activeMap();
+  if (!pin.speed || !m?.scale) return null;
+  const maxTotal = pin.speed * m.scale;
+  const traveled = m.initiative?.traveled?.[pin.id] || 0;
+  return { remaining: Math.max(0, maxTotal - traveled), maxTotal, traveledFt: traveled / m.scale, maxFt: maxTotal / m.scale };
+}
+// A monster's speed/movement is the DM's info to manage — a player doesn't need to see how
+// far it can move (as a number, or as the size of a range circle), only where it actually is.
+function showSpeedInfo(pin) {
+  return myRole === 'dm' || pin.type !== 'monster';
+}
+
+let toastTimer = null;
+function showToast(message) {
+  toast.textContent = message;
+  toast.classList.remove('hidden');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => toast.classList.add('hidden'), 5000);
+}
+
+// ── realtime connection ────────────────────────────────────────────────
+// All shared state (maps, scale, pins) lives on the server and is pushed to
+// every connection over this socket. Pan/zoom is local-only (see saveLocalView
+// below) and never sent. A connection identifies itself once as the DM or as
+// a player linked to one pin id; the server enforces what each may change.
+let socket = null;
+function connectSocket() {
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  socket = new WebSocket(`${proto}://${location.host}/ws`);
+  socket.addEventListener('open', () => {
+    socket.send(JSON.stringify({ type: 'hello', role: myRole, pinId: myPinId }));
+  });
+  socket.addEventListener('message', (e) => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'state') applyRemoteState(msg.state);
+  });
+  socket.addEventListener('close', () => { setTimeout(connectSocket, 1500); });
+  socket.addEventListener('error', () => { try { socket.close(); } catch {} });
+}
+function sendAction(action) {
+  if (socket && socket.readyState === WebSocket.OPEN) socket.send(JSON.stringify(action));
+  else showToast('Not connected — reconnecting… that change may not have saved.');
+}
+
+function applyRemoteState(newState) {
+  const prevActiveId = state.activeMapId;
+  state = newState;
+  if (!booted || state.activeMapId !== prevActiveId) {
+    booted = true;
+    loadActiveMap();
+  } else {
+    const m = activeMap();
+    pins = m?.pins || [];
+    renderAllPins();
+    renderObstacles();
+    populateMapSelect();
+    updateToolbarState();
+    renderTurnOrder();
+    if (!initiativeDialog.classList.contains('hidden')) renderInitiativeSetup();
+    if (m && m.scale && mode === 'set-scale') setMode('pan');
+  }
+  if (myRole === 'player') {
+    const exists = activeMap()?.pins?.some(p => p.id === myPinId);
+    if (!exists && !missingPinWarned) {
+      missingPinWarned = true;
+      showToast("Your character isn't on this map — check your link with the DM.");
+    } else if (exists) {
+      missingPinWarned = false;
+    }
+  }
+}
+
+// ── local camera (pan/zoom) — per browser, per map, never sent to the server ─
+function viewKey(mapId) { return `battlemap-view:${mapId}`; }
+function loadLocalView(mapId) {
+  try {
+    const raw = localStorage.getItem(viewKey(mapId));
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return { panX: 0, panY: 0, zoom: 1 };
+}
+let viewSaveTimer = null;
+function saveLocalView() {
+  if (!state.activeMapId) return;
+  clearTimeout(viewSaveTimer);
+  viewSaveTimer = setTimeout(() => {
+    try { localStorage.setItem(viewKey(state.activeMapId), JSON.stringify({ panX, panY, zoom })); } catch {}
+  }, 200);
+}
+
+// ── name dialog (new map only) ────────────────────────────────────────
+let nameDialogResolve = null;
+function askName(title, defaultValue = '') {
+  nameDialogTitle.textContent = title;
+  nameDialogInput.value = defaultValue;
+  nameDialog.classList.remove('hidden');
+  nameDialogInput.focus();
+  nameDialogInput.select();
+  return new Promise((resolve) => { nameDialogResolve = resolve; });
+}
+function closeNameDialog(value) {
+  nameDialog.classList.add('hidden');
+  if (nameDialogResolve) { nameDialogResolve(value); nameDialogResolve = null; }
+}
+nameDialogOk.addEventListener('click', () => closeNameDialog(nameDialogInput.value.trim() || null));
+nameDialogCancel.addEventListener('click', () => closeNameDialog(null));
+nameDialogInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') closeNameDialog(nameDialogInput.value.trim() || null);
+  if (e.key === 'Escape') closeNameDialog(null);
+});
+
+// ── scale dialog (two-point calibration) ─────────────────────────────
+let scaleDialogResolve = null;
+function askDistance(defaultValue) {
+  scaleDialogInput.value = defaultValue;
+  scaleDialog.classList.remove('hidden');
+  scaleDialogInput.focus();
+  scaleDialogInput.select();
+  return new Promise((resolve) => { scaleDialogResolve = resolve; });
+}
+function closeScaleDialog(value) {
+  scaleDialog.classList.add('hidden');
+  if (scaleDialogResolve) { scaleDialogResolve(value); scaleDialogResolve = null; }
+}
+scaleDialogOk.addEventListener('click', () => {
+  const v = parseFloat(scaleDialogInput.value);
+  closeScaleDialog(v > 0 ? v : null);
+});
+scaleDialogCancel.addEventListener('click', () => closeScaleDialog(null));
+scaleDialogInput.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') scaleDialogOk.click();
+  if (e.key === 'Escape') closeScaleDialog(null);
+});
+
+// ── pin dialog (create + edit: name, type, size, speed) ────────────────
+let pinDialogType = 'player';
+let pinDialogResolve = null;
+function askPinDetails({ title, name = '', type = 'player', size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null }) {
+  pinDialogTitle.textContent = title;
+  pinDialogName.value = name;
+  pinDialogSize.value = size;
+  pinDialogSpeed.value = speed;
+  pinDialogHpCurrent.value = hpCurrent ?? '';
+  pinDialogHpMax.value = hpMax ?? '';
+  pinDialogType = type;
+  updatePinTypeButtons();
+  pinDialog.classList.remove('hidden');
+  pinDialogName.focus();
+  pinDialogName.select();
+  return new Promise((resolve) => { pinDialogResolve = resolve; });
+}
+btnImportStatblock.addEventListener('click', () => statblockInput.click());
+statblockInput.addEventListener('change', async () => {
+  const file = statblockInput.files[0];
+  statblockInput.value = '';
+  if (!file) return;
+  try {
+    const data = JSON.parse(await file.text());
+    if (data.meta?.name) pinDialogName.value = data.meta.name;
+    if (data.combat?.speed != null) pinDialogSpeed.value = data.combat.speed;
+    if (data.combat?.hpMax != null) pinDialogHpMax.value = data.combat.hpMax;
+    if (data.combat?.hpCurrent != null) pinDialogHpCurrent.value = data.combat.hpCurrent;
+  } catch (err) {
+    showToast('Could not read that file — expected a character sheet JSON export.');
+  }
+});
+function updatePinTypeButtons() {
+  pinTypePlayer.classList.toggle('active', pinDialogType === 'player');
+  pinTypeMonster.classList.toggle('active', pinDialogType === 'monster');
+}
+function closePinDialog(value) {
+  pinDialog.classList.add('hidden');
+  if (pinDialogResolve) { pinDialogResolve(value); pinDialogResolve = null; }
+}
+pinTypePlayer.addEventListener('click', () => { pinDialogType = 'player'; updatePinTypeButtons(); });
+pinTypeMonster.addEventListener('click', () => { pinDialogType = 'monster'; updatePinTypeButtons(); });
+pinDialogCancel.addEventListener('click', () => closePinDialog(null));
+pinDialogSave.addEventListener('click', () => {
+  const name = pinDialogName.value.trim();
+  if (!name) return;
+  const speed = clamp(parseFloat(pinDialogSpeed.value) || 0, 0, 1000);
+  const size = pinDialogSize.value;
+  const hpMaxRaw = pinDialogHpMax.value.trim();
+  const hpMax = hpMaxRaw ? clamp(parseFloat(hpMaxRaw) || 0, 0, 9999) : null;
+  const hpCurrentRaw = pinDialogHpCurrent.value.trim();
+  let hpCurrent = hpCurrentRaw ? clamp(parseFloat(hpCurrentRaw) || 0, 0, 9999) : null;
+  if (hpMax != null && hpCurrent == null) hpCurrent = hpMax; // only max given — assume undamaged
+  closePinDialog({ name, type: pinDialogType, size, speed, hpMax, hpCurrent });
+});
+pinDialogName.addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') pinDialogSave.click();
+  if (e.key === 'Escape') closePinDialog(null);
+});
+
+// ── confirm dialog ────────────────────────────────────────────────────
+let confirmResolve = null;
+function askConfirm(message) {
+  confirmMessage.textContent = message;
+  confirmDialog.classList.remove('hidden');
+  return new Promise((resolve) => { confirmResolve = resolve; });
+}
+function closeConfirm(value) {
+  confirmDialog.classList.add('hidden');
+  if (confirmResolve) { confirmResolve(value); confirmResolve = null; }
+}
+confirmCancel.addEventListener('click', () => closeConfirm(false));
+confirmOk.addEventListener('click', () => closeConfirm(true));
+
+// ── movement range (shown for the currently-selected pin) ────────────
+function clearRange() { rangeLayer.innerHTML = ''; }
+function drawRange(pin) {
+  const scale = activeMap()?.scale;
+  if (!scale || !pin.speed || !showSpeedInfo(pin)) { clearRange(); return; }
+  // If this pin is mid-turn and has already used some of its speed, show what's actually
+  // left rather than a fresh full circle — matches the clamp this same drag is about to hit.
+  const rs = isActiveTurnPin(pin) ? remainingSpeed(pin) : null;
+  const r = rs ? rs.remaining : pin.speed * scale;
+  const color = pin.type === 'player' ? 'var(--player)' : 'var(--monster)';
+  rangeLayer.innerHTML = `<circle cx="${pin.wx}" cy="${pin.wy}" r="${r}" fill="${color}" fill-opacity="0.18" stroke="${color}" stroke-opacity="0.55" stroke-width="2"/>`;
+}
+
+// ── initiative setup (DM builds/reorders the turn order before combat) ─
+function renderInitiativeSetup() {
+  const m = activeMap();
+  const combat = m?.initiative || { order: [] };
+  const orderedIds = new Set(combat.order.flatMap(e => e.pinIds));
+  const available = pins.filter(p => !orderedIds.has(p.id));
+
+  initAvailableList.innerHTML = available.length
+    ? available.map(p => `
+        <li><label>
+          <input type="checkbox" value="${p.id}">
+          <span class="init-dot init-${p.type}"></span>
+          <span class="init-entry-name">${escapeHtml(p.name)}</span>
+        </label></li>`).join('')
+    : '<li class="init-empty">Nothing left to add.</li>';
+
+  initOrderList.innerHTML = combat.order.length
+    ? combat.order.map((entry, i) => {
+        const members = entry.pinIds.map(id => pins.find(p => p.id === id)).filter(Boolean);
+        const isGroup = members.length > 1;
+        const chips = members.map(p => `
+          <span class="init-chip"><span class="init-dot init-${p.type}"></span>${escapeHtml(p.name)}</span>
+        `).join('');
+        return `<li class="${isGroup ? 'init-group' : ''}">
+          <div class="init-order-head">
+            <span class="init-order-turn">Turn ${i + 1}</span>
+            ${isGroup ? `<span class="init-group-badge">${members.length} together</span>` : ''}
+            <span class="init-order-controls">
+              <button type="button" class="init-mini" data-action="up" data-index="${i}"${i === 0 ? ' disabled' : ''}>↑</button>
+              <button type="button" class="init-mini" data-action="down" data-index="${i}"${i === combat.order.length - 1 ? ' disabled' : ''}>↓</button>
+              <button type="button" class="init-mini" data-action="remove" data-index="${i}">×</button>
+            </span>
+          </div>
+          <div class="init-order-members">${chips}</div>
+        </li>`;
+      }).join('')
+    : '<li class="init-empty">No one in the order yet.</li>';
+
+  btnStartCombat.disabled = combat.order.length === 0 || combat.active;
+  btnStartCombat.textContent = combat.active ? 'Combat in progress' : 'Start Combat';
+}
+btnInitiative.addEventListener('click', () => {
+  renderInitiativeSetup();
+  initiativeDialog.classList.remove('hidden');
+});
+initDialogClose.addEventListener('click', () => initiativeDialog.classList.add('hidden'));
+function resetTraveled(m, entry) {
+  if (!entry) return;
+  for (const pinId of entry.pinIds) m.initiative.traveled[pinId] = 0;
+}
+// Mirrors the server's re-anchoring: order edits are allowed mid-fight too (a latecomer
+// joining, a reorder), so whoever's turn it is needs to be re-found by entry id — a stable
+// identity across a reorder — rather than by index, which isn't.
+function reanchorActiveIndex(m, oldOrder, oldIndex) {
+  const init = m.initiative;
+  if (!init.active) return;
+  const activeId = oldOrder[oldIndex]?.id;
+  const newIndex = init.order.findIndex(e => e.id === activeId);
+  if (newIndex !== -1) {
+    init.currentIndex = newIndex;
+  } else if (init.order.length) {
+    if (init.currentIndex >= init.order.length) { init.currentIndex = 0; init.round += 1; }
+    resetTraveled(m, init.order[init.currentIndex]);
+  } else {
+    init.active = false; init.currentIndex = 0; init.round = 1; init.traveled = {};
+  }
+}
+btnAddToOrder.addEventListener('click', () => {
+  const m = activeMap();
+  if (!m) return;
+  const checked = [...initAvailableList.querySelectorAll('input:checked')].map(cb => cb.value);
+  if (!checked.length) return;
+  if (!m.initiative) m.initiative = { order: [], active: false, currentIndex: 0, round: 1, traveled: {} };
+  const oldOrder = m.initiative.order.slice(), oldIndex = m.initiative.currentIndex;
+  m.initiative.order.push({ id: crypto.randomUUID(), pinIds: checked });
+  reanchorActiveIndex(m, oldOrder, oldIndex);
+  renderInitiativeSetup();
+  renderTurnOrder();
+  sendAction({ type: 'setInitiativeOrder', mapId: m.id, order: m.initiative.order });
+});
+initOrderList.addEventListener('click', (e) => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const m = activeMap();
+  const combat = m?.initiative;
+  if (!combat) return;
+  const oldOrder = combat.order.slice(), oldIndex = combat.currentIndex;
+  const i = parseInt(btn.dataset.index, 10);
+  if (btn.dataset.action === 'up' && i > 0) {
+    [combat.order[i - 1], combat.order[i]] = [combat.order[i], combat.order[i - 1]];
+  } else if (btn.dataset.action === 'down' && i < combat.order.length - 1) {
+    [combat.order[i + 1], combat.order[i]] = [combat.order[i], combat.order[i + 1]];
+  } else if (btn.dataset.action === 'remove') {
+    combat.order.splice(i, 1);
+  } else {
+    return;
+  }
+  reanchorActiveIndex(m, oldOrder, oldIndex);
+  renderInitiativeSetup();
+  renderTurnOrder();
+  sendAction({ type: 'setInitiativeOrder', mapId: m.id, order: combat.order });
+});
+btnStartCombat.addEventListener('click', () => {
+  const m = activeMap();
+  if (!m || !m.initiative?.order?.length) return;
+  initiativeDialog.classList.add('hidden');
+  // Mutate local state before sending: broadcastState excludes the sender (avoids
+  // echo races elsewhere), so the DM's own client won't hear its own combat actions back.
+  m.initiative.active = true;
+  m.initiative.currentIndex = 0;
+  m.initiative.round = 1;
+  m.initiative.traveled = {};
+  resetTraveled(m, m.initiative.order[0]);
+  renderTurnOrder();
+  sendAction({ type: 'startCombat', mapId: m.id });
+});
+
+// ── turn order (docked overlay, visible to everyone once combat starts) ─
+function formatFt(n) {
+  return (Math.round(n * 10) / 10).toString().replace(/\.0$/, '');
+}
+function renderTurnOrder() {
+  const m = activeMap();
+  const combat = m?.initiative;
+  if (!combat?.active || !combat.order.length) {
+    turnOrderPanel.classList.add('hidden');
+    turnRangeLayer.innerHTML = '';
+    return;
+  }
+  turnOrderPanel.classList.remove('hidden');
+  turnRound.textContent = combat.round;
+
+  const entry = combat.order[combat.currentIndex];
+  turnOrderRows.innerHTML = combat.order.map((e, i) => {
+    const entryPins = e.pinIds.map(id => pins.find(p => p.id === id)).filter(Boolean);
+    const label = entryPins.map(p => escapeHtml(p.name)).join(', ') || '?';
+    const dotType = entryPins[0]?.type || 'player';
+    let moveLine = '';
+    if (i === combat.currentIndex) {
+      moveLine = entryPins.map(p => {
+        if (!showSpeedInfo(p)) return '';
+        const r = remainingSpeed(p);
+        if (!r) return '';
+        return `<div class="turn-moved">${entryPins.length > 1 ? escapeHtml(p.name) + ': ' : ''}${formatFt(r.traveledFt)}/${formatFt(r.maxFt)} ft moved</div>`;
+      }).join('');
+    }
+    return `<li class="${i === combat.currentIndex ? 'active' : ''}"><span class="turn-dot turn-${dotType}"></span><div class="turn-entry"><div class="turn-entry-name">${label}</div>${moveLine}</div></li>`;
+  }).join('');
+
+  const myTurn = myRole === 'dm' || (myRole === 'player' && entry?.pinIds.includes(myPinId));
+  btnEndTurn.classList.toggle('hidden', !myTurn);
+
+  // Persistent dashed range indicator for a solo active entry (skipped for grouped entries
+  // to avoid overlapping circles) — distinct from the solid transient one used on click/drag.
+  // Anchored to the pin's LIVE position and shrunk to the remaining budget, so it visibly
+  // contracts (and recenters) after each move rather than staying fixed for the whole turn.
+  if (entry && entry.pinIds.length === 1) {
+    const pin = pins.find(p => p.id === entry.pinIds[0]);
+    const r = pin && showSpeedInfo(pin) && remainingSpeed(pin);
+    if (pin && r && r.remaining > 0) {
+      const color = pin.type === 'player' ? 'var(--player)' : 'var(--monster)';
+      turnRangeLayer.innerHTML = `<circle cx="${pin.wx}" cy="${pin.wy}" r="${r.remaining}" fill="${color}" fill-opacity="0.12" stroke="${color}" stroke-opacity="0.45" stroke-dasharray="4 3" stroke-width="2"/>`;
+      return;
+    }
+  }
+  turnRangeLayer.innerHTML = '';
+}
+btnEndTurn.addEventListener('click', () => {
+  const m = activeMap();
+  if (!m || !m.initiative?.active) return;
+  const order = m.initiative.order;
+  let next = m.initiative.currentIndex + 1;
+  if (next >= order.length) { next = 0; m.initiative.round += 1; }
+  m.initiative.currentIndex = next;
+  resetTraveled(m, order[next]);
+  renderTurnOrder();
+  sendAction({ type: 'endTurn', mapId: m.id });
+});
+btnStopCombat.addEventListener('click', async () => {
+  const m = activeMap();
+  if (!m) return;
+  const ok = await askConfirm('End combat? The turn order stays saved for next time.');
+  if (!ok) return;
+  m.initiative.active = false;
+  m.initiative.currentIndex = 0;
+  m.initiative.round = 1;
+  m.initiative.traveled = {};
+  renderTurnOrder();
+  sendAction({ type: 'stopCombat', mapId: m.id });
+});
+
+// ── distances-on-click panel ──────────────────────────────────────────
+function hideDistancePanel() { distancePanel.classList.add('hidden'); currentPanelPinId = null; clearRange(); }
+function showDistancePanel(pin, screenX, screenY) {
+  currentPanelPinId = pin.id;
+  drawRange(pin);
+  const scale = activeMap()?.scale || 1;
+  const rows = pins
+    .filter(p => p.id !== pin.id)
+    .map(p => ({
+      name: p.name,
+      type: p.type,
+      feet: Math.hypot(p.wx - pin.wx, p.wy - pin.wy) / scale,
+    }))
+    .sort((a, b) => a.feet - b.feet);
+
+  dpTitle.textContent = pin.name;
+  const sizeLabel = (pin.size || DEFAULT_SIZE).replace(/^./, c => c.toUpperCase());
+  dpSpeed.textContent = `${sizeLabel}${pin.speed && showSpeedInfo(pin) ? ` · ${pin.speed} ft/turn` : ''}`;
+  const canEditHp = canControlPin(pin);
+  if (pin.hpMax != null) {
+    dpHpRow.classList.remove('hidden');
+    dpHpInput.max = pin.hpMax;
+    dpHpInput.value = pin.hpCurrent ?? pin.hpMax;
+    dpHpInput.disabled = !canEditHp;
+    dpHpMax.textContent = pin.hpMax;
+    dpHpInput.onchange = canEditHp ? () => {
+      const v = clamp(parseFloat(dpHpInput.value) || 0, 0, pin.hpMax);
+      pin.hpCurrent = v;
+      dpHpInput.value = v;
+      renderAllPins();
+      sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { hpCurrent: v } });
+    } : null;
+  } else {
+    dpHpRow.classList.add('hidden');
+  }
+  dpList.innerHTML = rows.length
+    ? rows.map(r => `<li><span class="dp-dot dp-${r.type}"></span>${escapeHtml(r.name)}<span class="dp-ft">${r.feet.toFixed(0)} ft</span></li>`).join('')
+    : '<li class="dp-empty">No other pins yet.</li>';
+
+  distancePanel.classList.remove('hidden');
+  const w = distancePanel.offsetWidth, h = distancePanel.offsetHeight;
+  distancePanel.style.left = Math.max(4, Math.min(screenX + 12, window.innerWidth - w - 4)) + 'px';
+  distancePanel.style.top = Math.max(4, Math.min(screenY + 12, window.innerHeight - h - 4)) + 'px';
+}
+dpClose.addEventListener('click', hideDistancePanel);
+dpLink.addEventListener('click', async () => {
+  const pin = pins.find(p => p.id === currentPanelPinId);
+  if (!pin) return;
+  const url = `${location.origin}/play/${pin.id}`;
+  try {
+    await navigator.clipboard.writeText(url);
+    showToast(`Player link for ${pin.name} copied.`);
+  } catch {
+    showToast(url); // clipboard blocked — at least surface it so it can be copied by hand
+  }
+});
+dpEdit.addEventListener('click', async () => {
+  const pin = pins.find(p => p.id === currentPanelPinId);
+  if (!pin) return;
+  hideDistancePanel();
+  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null });
+  if (!result) return;
+  pin.name = result.name;
+  pin.type = result.type;
+  pin.size = result.size;
+  pin.speed = result.speed;
+  pin.hpMax = result.hpMax;
+  pin.hpCurrent = result.hpCurrent;
+  renderAllPins();
+  sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent } });
+});
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') {
+    hideDistancePanel();
+    if (!confirmDialog.classList.contains('hidden')) closeConfirm(false);
+  }
+});
+
+function applyWorldTransform() { world.style.transform = `translate(${panX}px, ${panY}px) scale(${zoom})`; }
+
+function setMode(next) {
+  mode = next;
+  stage.className = 'mode-' + mode;
+  [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnObstacles].forEach(b => b.classList.remove('active'));
+  if (mode === 'set-scale') btnSetScale.classList.add('active');
+  if (mode === 'pan') btnPan.classList.add('active');
+  if (mode === 'add-player') btnAddPlayer.classList.add('active');
+  if (mode === 'add-monster') btnAddMonster.classList.add('active');
+  if (mode === 'measure') btnMeasure.classList.add('active');
+  if (mode === 'obstacles') btnObstacles.classList.add('active');
+  clearMeasurement();
+  hideDistancePanel();
+  const mine = myRole === 'player' ? 'your' : 'a';
+  const hints = {
+    'no-map': myRole === 'player' ? 'Waiting for the DM to set up the map…' : 'Import a PDF battle map to begin.',
+    'set-scale': 'Click two points on the map that you know the real-world distance between (e.g. opposite corners of a room), then enter that distance.',
+    'pan': `Drag to pan, scroll to zoom. Drag ${mine} pin to move it, click a pin to see distances and its movement range.`,
+    'add-player': 'Click on the map to place a player pin.',
+    'add-monster': 'Click on the map to place a monster pin.',
+    'measure': 'Click a start point, then an end point, to measure the distance.',
+    'obstacles': 'Drag to mark a solid area (walls, rocks, etc). Click an existing one to remove it. Only you can see these for now.',
+  };
+  statusEl.textContent = hints[mode] || '';
+}
+
+function populateMapSelect() {
+  const ids = Object.keys(state.maps || {});
+  mapSelect.innerHTML = ids.length
+    ? ids.map(id => `<option value="${id}"${id === state.activeMapId ? ' selected' : ''}>${escapeHtml(state.maps[id].name)}</option>`).join('')
+    : '<option value="">No maps yet</option>';
+  mapSelect.disabled = ids.length === 0;
+}
+
+function updateToolbarState() {
+  const m = activeMap();
+  const hasMap = !!m;
+  const hasScale = !!(m && m.scale);
+  placeholder.classList.toggle('hidden', hasMap);
+  btnSetScale.disabled = !hasMap;
+  btnPan.disabled = !hasScale;
+  btnAddPlayer.disabled = !hasScale;
+  btnAddMonster.disabled = !hasScale;
+  btnMeasure.disabled = !hasScale;
+  btnObstacles.disabled = !hasScale;
+  btnResetView.disabled = !hasScale;
+  btnDeleteMap.disabled = !hasMap;
+  btnInitiative.disabled = !hasScale;
+}
+
+// ── PDF rendering ───────────────────────────────────────────────────
+// The server broadcasts to every connection including the sender (see server.js), so the
+// same client can end up with two overlapping loadActiveMap() calls — e.g. a map switch
+// applied locally for responsiveness, then confirmed by the server's own broadcast, or two
+// rapid switches in a row. pdf.js throws if a second render() starts on a canvas before the
+// first finishes, so any in-flight render is explicitly cancelled before starting a new one.
+let currentRenderTask = null;
+async function renderPdf(url) {
+  const doc = await pdfjsLib.getDocument(url).promise;
+  const page = await doc.getPage(1);
+  const viewport = page.getViewport({ scale: 2 });
+  mapCanvas.width = viewport.width;
+  mapCanvas.height = viewport.height;
+  const ctx = mapCanvas.getContext('2d');
+  if (currentRenderTask) { try { currentRenderTask.cancel(); } catch {} }
+  const task = page.render({ canvasContext: ctx, viewport });
+  currentRenderTask = task;
+  try {
+    await task.promise;
+  } finally {
+    if (currentRenderTask === task) currentRenderTask = null;
+  }
+}
+
+let loadGen = 0;
+async function loadActiveMap() {
+  const gen = ++loadGen;
+  populateMapSelect();
+  const m = activeMap();
+  if (!m) {
+    pins = [];
+    renderAllPins();
+    renderObstacles();
+    setMode('no-map');
+    updateToolbarState();
+    renderTurnOrder();
+    return;
+  }
+  pins = m.pins || [];
+  ({ panX, panY, zoom } = loadLocalView(m.id));
+  applyWorldTransform();
+  renderAllPins();
+  renderObstacles();
+  try {
+    await renderPdf(`/uploads/${m.file}?t=${Date.now()}`);
+  } catch (err) {
+    if (gen === loadGen) { // a cancelled (superseded) render is expected, not a real failure
+      console.error('Failed to render map PDF:', err);
+      showToast('This map\'s PDF file is missing — try re-importing it.');
+    }
+  }
+  if (gen !== loadGen) return; // a newer loadActiveMap() call has since taken over
+  updateToolbarState();
+  renderTurnOrder();
+  setMode(m.scale ? 'pan' : 'set-scale');
+}
+
+// ── pins ────────────────────────────────────────────────────────────
+function renderPin(pin) {
+  const draggable = canDragNow(pin); // DM can drag anything; a player only their own, and only on their turn once combat starts
+  const highlight = myRole === 'player' && myPinId === pin.id; // ring to help a player spot their own token
+  // Shared party vision can reveal a monster's existence (someone in the party has LOS to it)
+  // without THIS player's own pin having a clear line to it — losFromMe is only ever present
+  // (server-computed, per viewer) on a player's own copy of a monster pin, never the DM's.
+  const noPersonalLos = pin.type === 'monster' && pin.losFromMe === false;
+  const el = document.createElement('div');
+  el.className = `pin pin-${pin.type}${draggable ? ' pin-draggable' : ''}${highlight ? ' pin-mine' : ''}${noPersonalLos ? ' pin-no-los' : ''}`;
+  el.dataset.id = pin.id;
+  el.style.left = pin.wx + 'px';
+  el.style.top = pin.wy + 'px';
+  const scale = activeMap()?.scale || 20;
+  const feet = SIZE_FEET[pin.size] ?? SIZE_FEET[DEFAULT_SIZE];
+  const diameter = Math.max(12, feet * scale);
+  let hpBar = '';
+  if (pin.hpMax > 0) {
+    const ratio = clamp((pin.hpCurrent ?? pin.hpMax) / pin.hpMax, 0, 1);
+    const hpColor = ratio > 0.5 ? 'var(--player)' : ratio > 0.25 ? 'var(--measure)' : 'var(--monster)';
+    const barWidth = Math.min(diameter, 70);
+    hpBar = `<div class="pin-hpbar" style="width:${barWidth}px"><div class="pin-hpfill" style="width:${ratio * 100}%;background:${hpColor}"></div></div>`;
+  }
+  const removeBtn = myRole === 'dm' ? '<button class="pin-remove" title="Remove pin">×</button>' : '';
+  const losTag = noPersonalLos ? ' <span class="pin-no-los-tag">no LOS</span>' : '';
+  el.innerHTML = `<div class="pin-dot" style="width:${diameter}px;height:${diameter}px"></div>${hpBar}<div class="pin-label">${escapeHtml(pin.name)}${losTag}</div>${removeBtn}`;
+  pinsLayer.appendChild(el);
+
+  const removeEl = el.querySelector('.pin-remove');
+  if (removeEl) removeEl.addEventListener('click', async (e) => {
+    e.stopPropagation();
+    const ok = await askConfirm(`Remove ${pin.name}?`);
+    if (!ok) return;
+    pins = pins.filter(p => p.id !== pin.id);
+    el.remove();
+    hideDistancePanel();
+    const m = activeMap();
+    if (m?.initiative) {
+      const init = m.initiative;
+      init.order.forEach(entry => { entry.pinIds = entry.pinIds.filter(id => id !== pin.id); });
+      init.order = init.order.filter(entry => entry.pinIds.length > 0);
+      delete init.traveled[pin.id];
+      if (init.active) {
+        if (!init.order.length) {
+          init.active = false; init.currentIndex = 0; init.round = 1; init.traveled = {};
+        } else {
+          if (init.currentIndex >= init.order.length) { init.currentIndex = 0; init.round += 1; }
+          resetTraveled(m, init.order[init.currentIndex]);
+        }
+      }
+      renderTurnOrder();
+    }
+    sendAction({ type: 'removePin', mapId: state.activeMapId, pinId: pin.id });
+  });
+
+  el.addEventListener('pointerdown', (e) => {
+    if (e.target.classList.contains('pin-remove') || mode !== 'pan' || !draggable) return;
+    e.stopPropagation();
+    hideDistancePanel();
+    safeCapture(el, e.pointerId);
+    const startX = e.clientX, startY = e.clientY;
+    const origWx = pin.wx, origWy = pin.wy;
+    const dragAnchor = { wx: origWx, wy: origWy };
+    drawRange(pin); // shown locked at the starting position for the whole drag, as a reference for how far the pin can move
+    let moved = false;
+    const onMove = (e2) => {
+      const dx = e2.clientX - startX, dy = e2.clientY - startY;
+      if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
+      const raw = clampToSpeed(pin, origWx + dx / zoom, origWy + dy / zoom, dragAnchor);
+      pin.wx = raw.wx;
+      pin.wy = raw.wy;
+      el.style.left = pin.wx + 'px';
+      el.style.top = pin.wy + 'px';
+    };
+    const onUp = (e2) => {
+      safeRelease(el, e.pointerId);
+      el.removeEventListener('pointermove', onMove);
+      el.removeEventListener('pointerup', onUp);
+      if (moved) {
+        clearRange();
+        const m = activeMap();
+        if (m?.initiative && isActiveTurnPin(pin)) {
+          const segDist = Math.hypot(pin.wx - origWx, pin.wy - origWy);
+          m.initiative.traveled[pin.id] = (m.initiative.traveled[pin.id] || 0) + segDist;
+          renderTurnOrder();
+        }
+        sendAction({ type: 'movePin', mapId: state.activeMapId, pinId: pin.id, wx: pin.wx, wy: pin.wy });
+      } else {
+        showDistancePanel(pin, e2.clientX, e2.clientY);
+      }
+    };
+    el.addEventListener('pointermove', onMove);
+    el.addEventListener('pointerup', onUp);
+  });
+}
+
+function renderAllPins() {
+  pinsLayer.innerHTML = '';
+  pins.forEach(renderPin);
+}
+
+// ── obstacles (DM-marked solid areas — line-of-sight/movement-blocking logic is future work;
+// for now this is just the authoring tool, and only the DM can see or edit them) ───────
+function renderObstacles() {
+  obstaclesLayer.innerHTML = '';
+  if (myRole !== 'dm') return; // defensive — the server already omits them from a player's state
+  const list = activeMap()?.obstacles || [];
+  list.forEach(o => {
+    const el = document.createElement('div');
+    el.className = 'obstacle-rect';
+    el.dataset.id = o.id;
+    el.style.left = o.x + 'px';
+    el.style.top = o.y + 'px';
+    el.style.width = o.w + 'px';
+    el.style.height = o.h + 'px';
+    el.innerHTML = '<button class="obstacle-remove" title="Remove solid area">×</button>';
+    el.querySelector('.obstacle-remove').addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const ok = await askConfirm('Remove this solid area?');
+      if (!ok) return;
+      const m = activeMap();
+      if (!m) return;
+      m.obstacles = m.obstacles.filter(x => x.id !== o.id);
+      renderObstacles();
+      sendAction({ type: 'removeObstacle', mapId: m.id, obstacleId: o.id });
+    });
+    obstaclesLayer.appendChild(el);
+  });
+}
+function drawObstaclePreview(x1, y1, x2, y2) {
+  const x = Math.min(x1, x2), y = Math.min(y1, y2);
+  const w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
+  obstaclePreview.style.left = x + 'px';
+  obstaclePreview.style.top = y + 'px';
+  obstaclePreview.style.width = w + 'px';
+  obstaclePreview.style.height = h + 'px';
+  obstaclePreview.classList.remove('hidden');
+}
+function clearObstaclePreview() { obstaclePreview.classList.add('hidden'); }
+function commitObstacle(x1, y1, x2, y2) {
+  const x = Math.min(x1, x2), y = Math.min(y1, y2);
+  const w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
+  if (w < 8 || h < 8) return; // filters out an accidental click/jitter, not a deliberate small mark
+  const m = activeMap();
+  if (!m) return;
+  const obstacle = { id: crypto.randomUUID(), x, y, w, h };
+  if (!m.obstacles) m.obstacles = [];
+  m.obstacles.push(obstacle);
+  renderObstacles();
+  sendAction({ type: 'addObstacle', mapId: m.id, obstacle });
+}
+
+// ── measuring / point-picking (shared by Measure and Set scale) ─────
+function clearMeasurement() {
+  pendingPoint = null;
+  measureLayer.innerHTML = '';
+}
+function drawDot(p) {
+  measureLayer.innerHTML = `<circle cx="${p.x}" cy="${p.y}" r="7" fill="none" stroke="var(--measure)" stroke-width="2"/>`;
+}
+function drawPlainLine(p1, p2) {
+  measureLayer.innerHTML = `
+    <line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" stroke="var(--measure)" stroke-width="3"/>
+    <circle cx="${p1.x}" cy="${p1.y}" r="5" fill="var(--measure)"/>
+    <circle cx="${p2.x}" cy="${p2.y}" r="5" fill="var(--measure)"/>
+  `;
+}
+function drawMeasureLine(p1, p2) {
+  const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
+  const feet = dist / (activeMap()?.scale || 1);
+  const mx = (p1.x + p2.x) / 2, my = (p1.y + p2.y) / 2;
+  measureLayer.innerHTML = `
+    <line x1="${p1.x}" y1="${p1.y}" x2="${p2.x}" y2="${p2.y}" stroke="var(--measure)" stroke-width="3"/>
+    <circle cx="${p1.x}" cy="${p1.y}" r="5" fill="var(--measure)"/>
+    <circle cx="${p2.x}" cy="${p2.y}" r="5" fill="var(--measure)"/>
+    <text class="measure-label" x="${mx}" y="${my - 10}" text-anchor="middle">${feet.toFixed(0)} ft</text>
+  `;
+}
+
+// ── stage interaction (drag to pan, click to act, pinch to zoom) ─────
+let dragState = null;
+let obstacleDragState = null; // separate from dragState: a drag in 'obstacles' mode draws a rectangle instead of panning
+// Two simultaneous pointers on the stage background (not started on a pin) means a touch
+// pinch/pan gesture — tracked separately from the single-pointer drag/click path above,
+// since mouse wheel already owns zoom for non-touch input.
+const activeTouches = new Map(); // pointerId -> {x,y}
+let pinch = null; // { startDist, startZoom, startMidX, startMidY, startPanX, startPanY }
+
+function beginPinch() {
+  dragState = null; // a second finger landing mid-drag cancels any single-finger pan/click
+  const pts = [...activeTouches.values()];
+  const [a, b] = pts;
+  pinch = {
+    startDist: Math.hypot(a.x - b.x, a.y - b.y),
+    startZoom: zoom,
+    startMidX: (a.x + b.x) / 2,
+    startMidY: (a.y + b.y) / 2,
+    startPanX: panX,
+    startPanY: panY,
+  };
+}
+
+function endTouch(pointerId) {
+  activeTouches.delete(pointerId);
+  if (pinch && activeTouches.size < 2) { pinch = null; saveLocalView(); }
+}
+
+stage.addEventListener('pointerdown', (e) => {
+  if ((mode === 'pan' && e.target.closest('.pin')) || mode === 'no-map') return;
+  hideDistancePanel();
+  safeCapture(stage, e.pointerId);
+
+  if (e.pointerType === 'touch') {
+    activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+    if (activeTouches.size === 2) { beginPinch(); return; }
+    if (activeTouches.size > 2) return; // ignore a third finger
+  }
+
+  if (mode === 'obstacles' && myRole === 'dm' && !e.target.closest('.obstacle-rect')) {
+    const rect = stage.getBoundingClientRect();
+    const worldX = ((e.clientX - rect.left) - panX) / zoom;
+    const worldY = ((e.clientY - rect.top) - panY) / zoom;
+    obstacleDragState = { startWorldX: worldX, startWorldY: worldY, moved: false };
+    return;
+  }
+  dragState = { startX: e.clientX, startY: e.clientY, moved: false, origPanX: panX, origPanY: panY };
+});
+
+stage.addEventListener('pointermove', (e) => {
+  if (activeTouches.has(e.pointerId)) activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
+
+  if (obstacleDragState) {
+    const rect = stage.getBoundingClientRect();
+    const worldX = ((e.clientX - rect.left) - panX) / zoom;
+    const worldY = ((e.clientY - rect.top) - panY) / zoom;
+    drawObstaclePreview(obstacleDragState.startWorldX, obstacleDragState.startWorldY, worldX, worldY);
+    return;
+  }
+
+  if (pinch) {
+    const rect = stage.getBoundingClientRect();
+    const [a, b] = [...activeTouches.values()];
+    const dist = Math.hypot(a.x - b.x, a.y - b.y);
+    const midX = (a.x + b.x) / 2, midY = (a.y + b.y) / 2;
+    const newZoom = clamp(pinch.startZoom * (dist / pinch.startDist), 0.15, 20);
+    // the point under the gesture's starting midpoint stays put as it scales, then the
+    // midpoint's own movement (two-finger pan) shifts it again on top of that
+    const worldX = (pinch.startMidX - rect.left - pinch.startPanX) / pinch.startZoom;
+    const worldY = (pinch.startMidY - rect.top - pinch.startPanY) / pinch.startZoom;
+    panX = (midX - rect.left) - worldX * newZoom;
+    panY = (midY - rect.top) - worldY * newZoom;
+    zoom = newZoom;
+    applyWorldTransform();
+    return;
+  }
+
+  if (!dragState) return;
+  const dx = e.clientX - dragState.startX, dy = e.clientY - dragState.startY;
+  if (Math.abs(dx) + Math.abs(dy) > 4) dragState.moved = true;
+  if (!dragState.moved) return;
+  panX = dragState.origPanX + dx; panY = dragState.origPanY + dy;
+  applyWorldTransform();
+});
+
+stage.addEventListener('pointerup', (e) => {
+  if (activeTouches.has(e.pointerId)) {
+    safeRelease(stage, e.pointerId);
+    const wasPinching = !!pinch;
+    endTouch(e.pointerId);
+    if (wasPinching) return; // don't treat the lifted finger as a click
+  }
+  if (obstacleDragState) {
+    const rect = stage.getBoundingClientRect();
+    const worldX = ((e.clientX - rect.left) - panX) / zoom;
+    const worldY = ((e.clientY - rect.top) - panY) / zoom;
+    safeRelease(stage, e.pointerId);
+    commitObstacle(obstacleDragState.startWorldX, obstacleDragState.startWorldY, worldX, worldY);
+    obstacleDragState = null;
+    clearObstaclePreview();
+    return;
+  }
+  if (!dragState) return;
+  const moved = dragState.moved;
+  safeRelease(stage, e.pointerId);
+  dragState = null;
+  if (moved) { saveLocalView(); return; }
+  handleStageClick(e);
+});
+
+stage.addEventListener('pointercancel', (e) => {
+  obstacleDragState = null;
+  clearObstaclePreview();
+  endTouch(e.pointerId);
+  dragState = null;
+});
+
+stage.addEventListener('wheel', (e) => {
+  if (mode === 'no-map') return;
+  e.preventDefault();
+  const rect = stage.getBoundingClientRect();
+  const cx = e.clientX - rect.left, cy = e.clientY - rect.top;
+  const factor = e.deltaY < 0 ? 1.1 : 1 / 1.1;
+  const newZoom = clamp(zoom * factor, 0.15, 20);
+  const f = newZoom / zoom;
+  panX = cx - (cx - panX) * f; panY = cy - (cy - panY) * f; zoom = newZoom;
+  applyWorldTransform();
+  saveLocalView();
+}, { passive: false });
+
+async function handleStageClick(e) {
+  const rect = stage.getBoundingClientRect();
+  const worldX = ((e.clientX - rect.left) - panX) / zoom;
+  const worldY = ((e.clientY - rect.top) - panY) / zoom;
+
+  if (mode === 'add-player' || mode === 'add-monster') {
+    if (myRole !== 'dm') return;
+    const type = mode === 'add-player' ? 'player' : 'monster';
+    const result = await askPinDetails({ title: `New ${type}`, type });
+    if (!result) return;
+    const pin = { id: crypto.randomUUID(), type: result.type, name: result.name, size: result.size, speed: result.speed, hpMax: result.hpMax, hpCurrent: result.hpCurrent, wx: worldX, wy: worldY };
+    pins.push(pin);
+    renderPin(pin);
+    sendAction({ type: 'addPin', mapId: state.activeMapId, pin });
+  } else if (mode === 'measure') {
+    if (!pendingPoint) {
+      pendingPoint = { x: worldX, y: worldY };
+      drawDot(pendingPoint);
+    } else {
+      drawMeasureLine(pendingPoint, { x: worldX, y: worldY });
+      pendingPoint = null;
+    }
+  } else if (mode === 'set-scale') {
+    if (myRole !== 'dm') return;
+    if (!pendingPoint) {
+      pendingPoint = { x: worldX, y: worldY };
+      drawDot(pendingPoint);
+    } else {
+      const p2 = { x: worldX, y: worldY };
+      const distPx = Math.hypot(p2.x - pendingPoint.x, p2.y - pendingPoint.y);
+      drawPlainLine(pendingPoint, p2);
+      pendingPoint = null;
+      const feet = await askDistance(5);
+      clearMeasurement();
+      if (!feet) return;
+      const m = activeMap();
+      if (!m) return;
+      m.scale = distPx / feet;
+      updateToolbarState();
+      setMode('pan');
+      sendAction({ type: 'setScale', mapId: m.id, scale: m.scale });
+    }
+  }
+}
+
+// ── toolbar wiring ──────────────────────────────────────────────────
+mapSelect.addEventListener('change', () => {
+  const activeMapId = mapSelect.value || null;
+  state.activeMapId = activeMapId;
+  loadActiveMap();
+  sendAction({ type: 'switchMap', activeMapId });
+});
+
+btnImport.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', async () => {
+  const file = fileInput.files[0];
+  if (!file) return;
+  const defaultName = file.name.replace(/\.pdf$/i, '');
+  const name = await askName('Name this map:', defaultName);
+  if (!name) { fileInput.value = ''; return; }
+  statusEl.textContent = 'Importing map…';
+  const fd = new FormData();
+  fd.append('map', file);
+  fd.append('name', name);
+  try {
+    const res = await fetch('/api/maps', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Import failed.');
+    // Don't apply `data` here — the resulting websocket broadcast (arriving momentarily)
+    // is what actually drives loadActiveMap(). Doing both would race two concurrent
+    // renderPdf() calls against the same canvas.
+  } catch (err) {
+    showToast(err.message || 'Import failed.');
+    setMode(mode); // restore the hint text that "Importing map…" overwrote
+  }
+  fileInput.value = '';
+});
+
+btnDeleteMap.addEventListener('click', async () => {
+  const m = activeMap();
+  if (!m) return;
+  const ok = await askConfirm(`Delete "${m.name}" and all its pins? This can't be undone.`);
+  if (!ok) return;
+  try {
+    const res = await fetch(`/api/maps/${m.id}`, { method: 'DELETE' });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.error || 'Delete failed.');
+    // Same as import above — rely on the websocket broadcast, not this response, to reload.
+  } catch (err) {
+    showToast(err.message || 'Could not delete map.');
+  }
+});
+
+btnSetScale.addEventListener('click', () => setMode('set-scale'));
+btnPan.addEventListener('click', () => setMode('pan'));
+btnAddPlayer.addEventListener('click', () => setMode('add-player'));
+btnAddMonster.addEventListener('click', () => setMode('add-monster'));
+btnMeasure.addEventListener('click', () => setMode('measure'));
+btnObstacles.addEventListener('click', () => setMode('obstacles'));
+btnResetView.addEventListener('click', () => {
+  panX = 0; panY = 0; zoom = 1;
+  applyWorldTransform();
+  saveLocalView();
+});
+
+// ── boot ────────────────────────────────────────────────────────────
+placeholder.textContent = myRole === 'player' ? 'Waiting for the DM to set up the map…' : 'Import a PDF battle map to begin.';
+connectSocket();
+</script>
+</body>
+</html>

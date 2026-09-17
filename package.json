@@ -1,0 +1,15 @@
+{
+  "name": "dnd-battlemap",
+  "version": "0.1.0",
+  "description": "Interactive DnD battle map — import a PDF map, calibrate a grid, drop pins, measure distances",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2",
+    "multer": "^2.0.0",
+    "pdfjs-dist": "^4.6.82",
+    "ws": "^8.21.3"
+  }
+}
