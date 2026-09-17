@@ -219,8 +219,12 @@
     font-size: 13px;
   }
   .modal-overlay .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
-  .type-toggle { display: flex; gap: 6px; margin-top: 8px; }
+  .type-toggle { display: flex; gap: 6px; margin-top: 8px; align-items: stretch; }
   .type-toggle button { flex: 1; }
+  .type-toggle input[type=color] {
+    flex: none; width: 38px; padding: 2px; background: #232636;
+    border: 1px solid var(--border); border-radius: 6px; cursor: pointer;
+  }
   .field-row { display: flex; gap: 12px; margin-top: 10px; }
   .field-row > label {
     flex: 1; display: flex; flex-direction: column; gap: 4px;
@@ -231,6 +235,17 @@
     border: 1px solid var(--border); border-radius: 6px; padding: 6px;
     font-size: 13px;
   }
+  .field-group { margin-top: 10px; }
+  .field-group-title { font-size: 12px; color: var(--muted); margin-bottom: 5px; }
+  .condition-grid { display: flex; flex-wrap: wrap; gap: 5px; }
+  .condition-chip {
+    display: flex; align-items: center; gap: 4px; cursor: pointer;
+    background: #232636; border: 1px solid var(--border); border-radius: 14px;
+    padding: 3px 9px 3px 7px; font-size: 12px; user-select: none;
+  }
+  .condition-chip input { margin: 0; accent-color: var(--accent); }
+  .condition-chip.checked { border-color: var(--accent); background: rgba(91,106,245,.15); }
+  .condition-chip:has(input:disabled) { cursor: default; opacity: .6; }
   .link-btn {
     display: block; width: 100%; margin-bottom: 10px;
     background: none; border: 1px dashed var(--border); color: var(--muted);
@@ -245,6 +260,15 @@
     background: rgba(255,255,255,.25); border-radius: 2px; overflow: hidden;
   }
   .pin-hpfill { height: 100%; }
+
+  .pin-conditions {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 1px;
+    max-width: 70px; margin-top: 2px; pointer-events: none;
+  }
+  .pin-conditions span {
+    font-size: 11px; line-height: 1; background: rgba(0,0,0,.72);
+    border-radius: 3px; padding: 1px 2px;
+  }
 
   #distancePanel {
     position: fixed;
@@ -276,6 +300,7 @@
     font-size: 13px; line-height: 1; padding: 2px 4px; cursor: pointer;
   }
   #distancePanel button.dp-icon:hover { color: var(--text); }
+  #distancePanel .dp-conditions:not(:empty) { margin: 8px 0; }
   #distancePanel ul { list-style: none; margin: 0; padding: 0; }
   #distancePanel li {
     display: flex; align-items: center; gap: 6px;
@@ -443,6 +468,7 @@
     <div class="type-toggle">
       <button type="button" id="pinTypePlayer">Player</button>
       <button type="button" id="pinTypeMonster">Monster</button>
+      <input type="color" id="pinDialogColor" title="Pin colour">
     </div>
     <div class="field-row">
       <label>Size
@@ -466,6 +492,10 @@
       <label>HP max
         <input type="number" id="pinDialogHpMax" min="0" placeholder="—">
       </label>
+    </div>
+    <div class="field-group">
+      <div class="field-group-title">Conditions</div>
+      <div id="pinDialogConditions" class="condition-grid"></div>
     </div>
     <div class="actions">
       <button id="pinDialogCancel">Cancel</button>
@@ -518,6 +548,7 @@
       <button class="dp-icon" id="dpClose" title="Close">×</button>
     </span>
   </div>
+  <div id="dpConditions" class="condition-grid dp-conditions"></div>
   <ul id="dpList"></ul>
 </div>
 
@@ -589,6 +620,8 @@ const pinDialogSize  = document.getElementById('pinDialogSize');
 const pinDialogSpeed = document.getElementById('pinDialogSpeed');
 const pinDialogHpCurrent = document.getElementById('pinDialogHpCurrent');
 const pinDialogHpMax = document.getElementById('pinDialogHpMax');
+const pinDialogColor = document.getElementById('pinDialogColor');
+const pinDialogConditions = document.getElementById('pinDialogConditions');
 const statblockInput = document.getElementById('statblockInput');
 const btnImportStatblock = document.getElementById('btnImportStatblock');
 const pinTypePlayer  = document.getElementById('pinTypePlayer');
@@ -607,6 +640,7 @@ const dpSpeed         = document.getElementById('dpSpeed');
 const dpHpRow           = document.getElementById('dpHpRow');
 const dpHpInput          = document.getElementById('dpHpInput');
 const dpHpMax             = document.getElementById('dpHpMax');
+const dpConditions        = document.getElementById('dpConditions');
 const dpList           = document.getElementById('dpList');
 const dpClose           = document.getElementById('dpClose');
 const dpEdit             = document.getElementById('dpEdit');
@@ -622,6 +656,33 @@ const DEFAULT_SIZE = 'medium';
 // draw plain circles with no creature art — so Small is nudged down for visual distinction
 // rather than gameplay accuracy.
 const SIZE_FEET = { tiny: 2.5, small: 4, medium: 5, large: 10, huge: 15, gargantuan: 20 };
+
+// A pin's colour used to be entirely implied by its type (player=green, monster=red) — now
+// it's an explicit, independently-chosen field. These are just the starting swatch shown
+// when a type is picked / toggled; pin.color is what actually renders once set.
+function defaultColorForType(type) { return type === 'player' ? '#3ecf6a' : '#e5484d'; }
+function pinColor(pin) { return pin.color || defaultColorForType(pin.type); }
+
+// Standard 5e conditions. Exhaustion is tracked as a flat on/off tag here, not by level —
+// deliberately out of scope for a first pass (see the story this was built from).
+const CONDITIONS = [
+  { id: 'blinded', label: 'Blinded', icon: '🙈' },
+  { id: 'charmed', label: 'Charmed', icon: '💘' },
+  { id: 'deafened', label: 'Deafened', icon: '🔇' },
+  { id: 'exhaustion', label: 'Exhaustion', icon: '🥵' },
+  { id: 'frightened', label: 'Frightened', icon: '😱' },
+  { id: 'grappled', label: 'Grappled', icon: '🤼' },
+  { id: 'incapacitated', label: 'Incapacitated', icon: '🚫' },
+  { id: 'invisible', label: 'Invisible', icon: '👻' },
+  { id: 'paralyzed', label: 'Paralyzed', icon: '⚡' },
+  { id: 'petrified', label: 'Petrified', icon: '🗿' },
+  { id: 'poisoned', label: 'Poisoned', icon: '🤢' },
+  { id: 'prone', label: 'Prone', icon: '🔻' },
+  { id: 'restrained', label: 'Restrained', icon: '🕸️' },
+  { id: 'stunned', label: 'Stunned', icon: '💫' },
+  { id: 'unconscious', label: 'Unconscious', icon: '💤' },
+];
+const CONDITION_BY_ID = Object.fromEntries(CONDITIONS.map(c => [c.id, c]));
 
 let state = { activeMapId: null, maps: {} }; // last-known server state
 let pins = [];              // working copy of the active map's pins
@@ -677,6 +738,28 @@ function clampToSpeed(pin, wx, wy, anchor) {
   if (dist <= remaining || dist === 0) return { wx, wy };
   const ratio = remaining / dist;
   return { wx: anchor.wx + dx * ratio, wy: anchor.wy + dy * ratio };
+}
+// Mirrors the server's obstacle-blocking check for the same jank-free-drag reason as
+// clampToSpeed above. A player's client never receives obstacles at all (DM-only data, see
+// stateForConnection in server.js) — for them this always sees an empty list and never blocks
+// locally; the server still enforces it, and since broadcasts now reach the sender too, an
+// illegal move a player's client didn't know to stop gets corrected within one round trip.
+function segmentsIntersect(p1, p2, p3, p4) {
+  const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
+  const d1 = cross(p3, p4, p1), d2 = cross(p3, p4, p2);
+  const d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
+  return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
+}
+function pathBlocked(fromWx, fromWy, toWx, toWy) {
+  const obstacles = activeMap()?.obstacles || [];
+  const pa = { x: fromWx, y: fromWy }, pb = { x: toWx, y: toWy };
+  for (const o of obstacles) {
+    const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
+    for (let i = 0; i < 4; i++) {
+      if (segmentsIntersect(pa, pb, c[i], c[(i + 1) % 4])) return true;
+    }
+  }
+  return false;
 }
 function remainingSpeed(pin) {
   const m = activeMap();
@@ -814,10 +897,27 @@ scaleDialogInput.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeScaleDialog(null);
 });
 
-// ── pin dialog (create + edit: name, type, size, speed) ────────────────
+// ── pin dialog (create + edit: name, type, colour, size, speed, conditions) ──
 let pinDialogType = 'player';
 let pinDialogResolve = null;
-function askPinDetails({ title, name = '', type = 'player', size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null }) {
+function renderConditionCheckboxes(selected) {
+  const sel = new Set(selected || []);
+  pinDialogConditions.innerHTML = CONDITIONS.map(c => `
+    <label class="condition-chip${sel.has(c.id) ? ' checked' : ''}" data-id="${c.id}">
+      <input type="checkbox" ${sel.has(c.id) ? 'checked' : ''}>${c.icon} ${c.label}
+    </label>
+  `).join('');
+}
+pinDialogConditions.addEventListener('change', (e) => {
+  const chip = e.target.closest('.condition-chip');
+  if (chip) chip.classList.toggle('checked', e.target.checked);
+});
+function selectedConditions() {
+  return [...pinDialogConditions.querySelectorAll('.condition-chip')]
+    .filter(chip => chip.querySelector('input').checked)
+    .map(chip => chip.dataset.id);
+}
+function askPinDetails({ title, name = '', type = 'player', color = null, size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null, conditions = [] }) {
   pinDialogTitle.textContent = title;
   pinDialogName.value = name;
   pinDialogSize.value = size;
@@ -825,6 +925,8 @@ function askPinDetails({ title, name = '', type = 'player', size = DEFAULT_SIZE,
   pinDialogHpCurrent.value = hpCurrent ?? '';
   pinDialogHpMax.value = hpMax ?? '';
   pinDialogType = type;
+  pinDialogColor.value = color || defaultColorForType(type);
+  renderConditionCheckboxes(conditions);
   updatePinTypeButtons();
   pinDialog.classList.remove('hidden');
   pinDialogName.focus();
@@ -854,8 +956,11 @@ function closePinDialog(value) {
   pinDialog.classList.add('hidden');
   if (pinDialogResolve) { pinDialogResolve(value); pinDialogResolve = null; }
 }
-pinTypePlayer.addEventListener('click', () => { pinDialogType = 'player'; updatePinTypeButtons(); });
-pinTypeMonster.addEventListener('click', () => { pinDialogType = 'monster'; updatePinTypeButtons(); });
+// Switching type resets the colour swatch to that type's default — a deliberate simplicity
+// tradeoff: tracking "did the user deliberately customize this" wasn't worth it for how
+// rarely someone would toggle type after already picking a custom colour.
+pinTypePlayer.addEventListener('click', () => { pinDialogType = 'player'; pinDialogColor.value = defaultColorForType('player'); updatePinTypeButtons(); });
+pinTypeMonster.addEventListener('click', () => { pinDialogType = 'monster'; pinDialogColor.value = defaultColorForType('monster'); updatePinTypeButtons(); });
 pinDialogCancel.addEventListener('click', () => closePinDialog(null));
 pinDialogSave.addEventListener('click', () => {
   const name = pinDialogName.value.trim();
@@ -867,7 +972,7 @@ pinDialogSave.addEventListener('click', () => {
   const hpCurrentRaw = pinDialogHpCurrent.value.trim();
   let hpCurrent = hpCurrentRaw ? clamp(parseFloat(hpCurrentRaw) || 0, 0, 9999) : null;
   if (hpMax != null && hpCurrent == null) hpCurrent = hpMax; // only max given — assume undamaged
-  closePinDialog({ name, type: pinDialogType, size, speed, hpMax, hpCurrent });
+  closePinDialog({ name, type: pinDialogType, color: pinDialogColor.value, size, speed, hpMax, hpCurrent, conditions: selectedConditions() });
 });
 pinDialogName.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') pinDialogSave.click();
@@ -912,7 +1017,7 @@ function renderInitiativeSetup() {
     ? available.map(p => `
         <li><label>
           <input type="checkbox" value="${p.id}">
-          <span class="init-dot init-${p.type}"></span>
+          <span class="init-dot" style="background:${pinColor(p)}"></span>
           <span class="init-entry-name">${escapeHtml(p.name)}</span>
         </label></li>`).join('')
     : '<li class="init-empty">Nothing left to add.</li>';
@@ -922,7 +1027,7 @@ function renderInitiativeSetup() {
         const members = entry.pinIds.map(id => pins.find(p => p.id === id)).filter(Boolean);
         const isGroup = members.length > 1;
         const chips = members.map(p => `
-          <span class="init-chip"><span class="init-dot init-${p.type}"></span>${escapeHtml(p.name)}</span>
+          <span class="init-chip"><span class="init-dot" style="background:${pinColor(p)}"></span>${escapeHtml(p.name)}</span>
         `).join('');
         return `<li class="${isGroup ? 'init-group' : ''}">
           <div class="init-order-head">
@@ -1037,7 +1142,7 @@ function renderTurnOrder() {
   turnOrderRows.innerHTML = combat.order.map((e, i) => {
     const entryPins = e.pinIds.map(id => pins.find(p => p.id === id)).filter(Boolean);
     const label = entryPins.map(p => escapeHtml(p.name)).join(', ') || '?';
-    const dotType = entryPins[0]?.type || 'player';
+    const dotColor = entryPins[0] ? pinColor(entryPins[0]) : defaultColorForType('player');
     let moveLine = '';
     if (i === combat.currentIndex) {
       moveLine = entryPins.map(p => {
@@ -1047,7 +1152,7 @@ function renderTurnOrder() {
         return `<div class="turn-moved">${entryPins.length > 1 ? escapeHtml(p.name) + ': ' : ''}${formatFt(r.traveledFt)}/${formatFt(r.maxFt)} ft moved</div>`;
       }).join('');
     }
-    return `<li class="${i === combat.currentIndex ? 'active' : ''}"><span class="turn-dot turn-${dotType}"></span><div class="turn-entry"><div class="turn-entry-name">${label}</div>${moveLine}</div></li>`;
+    return `<li class="${i === combat.currentIndex ? 'active' : ''}"><span class="turn-dot" style="background:${dotColor}"></span><div class="turn-entry"><div class="turn-entry-name">${label}</div>${moveLine}</div></li>`;
   }).join('');
 
   const myTurn = myRole === 'dm' || (myRole === 'player' && entry?.pinIds.includes(myPinId));
@@ -1102,7 +1207,7 @@ function showDistancePanel(pin, screenX, screenY) {
     .filter(p => p.id !== pin.id)
     .map(p => ({
       name: p.name,
-      type: p.type,
+      color: pinColor(p),
       feet: Math.hypot(p.wx - pin.wx, p.wy - pin.wy) / scale,
     }))
     .sort((a, b) => a.feet - b.feet);
@@ -1127,8 +1232,25 @@ function showDistancePanel(pin, screenX, screenY) {
   } else {
     dpHpRow.classList.add('hidden');
   }
+  const pinConditions = new Set(pin.conditions || []);
+  dpConditions.innerHTML = CONDITIONS.map(c => `
+    <label class="condition-chip${pinConditions.has(c.id) ? ' checked' : ''}" data-id="${c.id}">
+      <input type="checkbox" ${pinConditions.has(c.id) ? 'checked' : ''}${canEditHp ? '' : ' disabled'}>${c.icon} ${c.label}
+    </label>
+  `).join('');
+  dpConditions.onchange = canEditHp ? (e) => {
+    const chip = e.target.closest('.condition-chip');
+    if (!chip) return;
+    chip.classList.toggle('checked', e.target.checked);
+    const id = chip.dataset.id;
+    const set = new Set(pin.conditions || []);
+    e.target.checked ? set.add(id) : set.delete(id);
+    pin.conditions = [...set];
+    renderAllPins();
+    sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { conditions: pin.conditions } });
+  } : null;
   dpList.innerHTML = rows.length
-    ? rows.map(r => `<li><span class="dp-dot dp-${r.type}"></span>${escapeHtml(r.name)}<span class="dp-ft">${r.feet.toFixed(0)} ft</span></li>`).join('')
+    ? rows.map(r => `<li><span class="dp-dot" style="background:${r.color}"></span>${escapeHtml(r.name)}<span class="dp-ft">${r.feet.toFixed(0)} ft</span></li>`).join('')
     : '<li class="dp-empty">No other pins yet.</li>';
 
   distancePanel.classList.remove('hidden');
@@ -1152,16 +1274,18 @@ dpEdit.addEventListener('click', async () => {
   const pin = pins.find(p => p.id === currentPanelPinId);
   if (!pin) return;
   hideDistancePanel();
-  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null });
+  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, color: pin.color ?? null, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null, conditions: pin.conditions ?? [] });
   if (!result) return;
   pin.name = result.name;
   pin.type = result.type;
+  pin.color = result.color;
   pin.size = result.size;
   pin.speed = result.speed;
   pin.hpMax = result.hpMax;
   pin.hpCurrent = result.hpCurrent;
+  pin.conditions = result.conditions;
   renderAllPins();
-  sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent } });
+  sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, color: pin.color, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent, conditions: pin.conditions } });
 });
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
@@ -1303,7 +1427,11 @@ function renderPin(pin) {
   }
   const removeBtn = myRole === 'dm' ? '<button class="pin-remove" title="Remove pin">×</button>' : '';
   const losTag = noPersonalLos ? ' <span class="pin-no-los-tag">no LOS</span>' : '';
-  el.innerHTML = `<div class="pin-dot" style="width:${diameter}px;height:${diameter}px"></div>${hpBar}<div class="pin-label">${escapeHtml(pin.name)}${losTag}</div>${removeBtn}`;
+  const conditions = (pin.conditions || []).map(id => CONDITION_BY_ID[id]).filter(Boolean);
+  const conditionsRow = conditions.length
+    ? `<div class="pin-conditions">${conditions.map(c => `<span title="${c.label}">${c.icon}</span>`).join('')}</div>`
+    : '';
+  el.innerHTML = `<div class="pin-dot" style="width:${diameter}px;height:${diameter}px;background:${pinColor(pin)}"></div>${hpBar}<div class="pin-label">${escapeHtml(pin.name)}${losTag}</div>${conditionsRow}${removeBtn}`;
   pinsLayer.appendChild(el);
 
   const removeEl = el.querySelector('.pin-remove');
@@ -1347,8 +1475,14 @@ function renderPin(pin) {
       const dx = e2.clientX - startX, dy = e2.clientY - startY;
       if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
       const raw = clampToSpeed(pin, origWx + dx / zoom, origWy + dy / zoom, dragAnchor);
-      pin.wx = raw.wx;
-      pin.wy = raw.wy;
+      // A solid area blocks the move outright rather than sliding to contact (see the story
+      // this was scoped from) — so a candidate whose straight line from the drag's start
+      // would cross one is simply not applied, leaving the pin at its last legal position
+      // this drag reached instead of snapping all the way back to where it started.
+      if (!pathBlocked(dragAnchor.wx, dragAnchor.wy, raw.wx, raw.wy)) {
+        pin.wx = raw.wx;
+        pin.wy = raw.wy;
+      }
       el.style.left = pin.wx + 'px';
       el.style.top = pin.wy + 'px';
     };
@@ -1597,7 +1731,7 @@ async function handleStageClick(e) {
     const type = mode === 'add-player' ? 'player' : 'monster';
     const result = await askPinDetails({ title: `New ${type}`, type });
     if (!result) return;
-    const pin = { id: crypto.randomUUID(), type: result.type, name: result.name, size: result.size, speed: result.speed, hpMax: result.hpMax, hpCurrent: result.hpCurrent, wx: worldX, wy: worldY };
+    const pin = { id: crypto.randomUUID(), type: result.type, name: result.name, color: result.color, size: result.size, speed: result.speed, hpMax: result.hpMax, hpCurrent: result.hpCurrent, conditions: result.conditions, wx: worldX, wy: worldY };
     pins.push(pin);
     renderPin(pin);
     sendAction({ type: 'addPin', mapId: state.activeMapId, pin });

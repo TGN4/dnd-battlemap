@@ -104,7 +104,7 @@ app.post('/api/maps', (req, res) => {
       name,
       file: `${id}.pdf`,
       scale: null, // pixels-per-foot, set by clicking two points a known distance apart
-      pins: [], // { id, type: 'player'|'monster', name, speed, hpMax, hpCurrent, hidden, wx, wy }
+      pins: [], // { id, type: 'player'|'monster', name, color, speed, hpMax, hpCurrent, conditions, hidden, wx, wy }
       obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles, DM-only for now (see stateForConnection)
       initiative: defaultInitiative(),
     };
@@ -261,6 +261,13 @@ function handleMessage(conn, msg) {
         if (map.initiative?.active && !isActiveTurn) return; // and only on your own turn once combat has started
       }
 
+      // Solid areas block movement outright, regardless of turn state — a wall doesn't care
+      // whose turn it is. First pass: reject the whole move if its straight line crosses one,
+      // rather than sliding the pin to the point of contact (see the story this was built
+      // from). Reuses the same hasLOS check LOS filtering uses — "does a straight line cross
+      // any obstacle edge" is exactly what both need.
+      if (!hasLOS(pin, { wx: msg.wx, wy: msg.wy }, map.obstacles)) return;
+
       let wx = msg.wx, wy = msg.wy;
       if (isActiveTurn && pin.speed && map.scale) {
         // Clamp against the REMAINING budget (total speed minus what's already been moved
@@ -288,9 +295,10 @@ function handleMessage(conn, msg) {
       if (!pin || !msg.patch) return;
       const keys = Object.keys(msg.patch);
       if (conn.role === 'player') {
-        // players may only touch their own pin, and only its current HP
+        // players may only touch their own pin, and only its current HP or conditions —
+        // name/type/colour/size/speed stay DM-only
         if (conn.pinId !== msg.pinId) return;
-        if (!keys.every(k => k === 'hpCurrent')) return;
+        if (!keys.every(k => k === 'hpCurrent' || k === 'conditions')) return;
       }
       Object.assign(pin, msg.patch);
       break;
