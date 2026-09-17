@@ -6,7 +6,10 @@ const crypto  = require('crypto');
 const http    = require('http');
 const { WebSocketServer } = require('ws');
 
-const dataDir    = path.join(__dirname, 'data');
+// DATA_DIR lets a host mount persistent storage wherever it likes (e.g. a Render disk at
+// /data) without the app needing to know that host's checkout-directory convention; defaults
+// to the local dev layout (a `data/` folder next to server.js) when unset.
+const dataDir    = process.env.DATA_DIR || path.join(__dirname, 'data');
 const uploadsDir = path.join(dataDir, 'uploads');
 const statePath  = path.join(dataDir, 'battlemap-data.json');
 
