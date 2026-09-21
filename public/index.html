@@ -69,6 +69,7 @@
   body.player-mode #btnAddMonster,
   body.player-mode #dpEdit,
   body.player-mode #dpLink,
+  body.player-mode #dpDuplicate,
   body.player-mode #btnInitiative,
   body.player-mode #btnObstacles,
   body.player-mode #btnAoeCone,
@@ -570,6 +571,7 @@
     <span class="dp-actions">
       <button class="dp-icon" id="dpLink" title="Copy player link">🔗</button>
       <button class="dp-icon" id="dpEdit" title="Edit">✎</button>
+      <button class="dp-icon" id="dpDuplicate" title="Duplicate">⧉</button>
       <button class="dp-icon" id="dpClose" title="Close">×</button>
     </span>
   </div>
@@ -678,6 +680,7 @@ const dpList           = document.getElementById('dpList');
 const dpClose           = document.getElementById('dpClose');
 const dpEdit             = document.getElementById('dpEdit');
 const dpLink              = document.getElementById('dpLink');
+const dpDuplicate         = document.getElementById('dpDuplicate');
 
 const toast = document.getElementById('toast');
 
@@ -1382,6 +1385,35 @@ dpEdit.addEventListener('click', async () => {
   renderAllPins();
   sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, color: pin.color, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent, conditions: pin.conditions, attackRange: pin.attackRange, attackLongRange: pin.attackLongRange } });
 });
+// "Goblin" -> "Goblin 2" -> "Goblin 3"; bumps past any name already taken on this map, so
+// duplicating the same pin repeatedly (the common case — a DM adding a pack of goblins one
+// at a time) never collides even if names were renamed out of order in between.
+function nextCopyName(baseName, existingNames) {
+  const m = baseName.match(/^(.*?)(\s*)(\d+)$/);
+  const stem = m ? m[1] : baseName;
+  const sep = m ? (m[2] || ' ') : ' ';
+  let n = m ? parseInt(m[3], 10) + 1 : 2;
+  let candidate = `${stem}${sep}${n}`;
+  while (existingNames.has(candidate)) { n += 1; candidate = `${stem}${sep}${n}`; }
+  return candidate;
+}
+dpDuplicate.addEventListener('click', () => {
+  const pin = pins.find(p => p.id === currentPanelPinId);
+  if (!pin) return;
+  const name = nextCopyName(pin.name, new Set(pins.map(p => p.name)));
+  // A fresh copy of the stat block, not a snapshot of this pin's current fight — full health,
+  // no lingering conditions, offset a bit so it doesn't land exactly on top of the original.
+  const copy = {
+    id: crypto.randomUUID(), type: pin.type, name, color: pin.color,
+    size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpMax,
+    conditions: [], attackRange: pin.attackRange, attackLongRange: pin.attackLongRange,
+    wx: pin.wx + 40, wy: pin.wy + 40,
+  };
+  pins.push(copy);
+  renderPin(copy);
+  sendAction({ type: 'addPin', mapId: state.activeMapId, pin: copy });
+  showToast(`Duplicated as ${name}.`);
+});
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     hideDistancePanel();
@@ -1804,6 +1836,12 @@ function endTouch(pointerId) {
 }
 
 stage.addEventListener('pointerdown', (e) => {
+  // turnOrderPanel lives inside #stage (so it can be positioned relative to the map), but its
+  // buttons (End turn, End combat) are their own UI, not part of the map surface — without this
+  // guard, a real pointerdown here still bubbles up and stage claims pointer capture for itself
+  // before the button's own click handler ever runs, silently swallowing the click (confirmed:
+  // e.target on the resulting click ends up retargeted to #stage, never reaching #btnEndTurn).
+  if (e.target.closest('#turnOrderPanel')) return;
   if ((mode === 'pan' && e.target.closest('.pin')) || mode === 'no-map') return;
   hideDistancePanel();
   safeCapture(stage, e.pointerId);
