@@ -1836,14 +1836,17 @@ function endTouch(pointerId) {
 }
 
 stage.addEventListener('pointerdown', (e) => {
-  // turnOrderPanel, obstacle-remove and aoe-remove all live inside #stage (so they can be
-  // positioned relative to the map), but they're their own UI, not part of the map surface —
-  // without this guard, a real pointerdown on any of them still bubbles up and stage claims
-  // pointer capture for itself before the control's own click handler ever runs, silently
+  // turnOrderPanel, obstacle-remove, aoe-remove and pin-remove all live inside #stage (so they
+  // can be positioned relative to the map), but they're their own UI, not part of the map
+  // surface — without this guard, a real pointerdown on any of them still bubbles up and stage
+  // claims pointer capture for itself before the control's own click handler ever runs, silently
   // swallowing the click (confirmed: e.target on the resulting click ends up retargeted to
   // #stage, never reaching the button — same failure mode for End turn, and for the × remove
-  // control on a solid area or an AoE template).
-  if (e.target.closest('#turnOrderPanel, .obstacle-remove, .aoe-remove')) return;
+  // control on a solid area or an AoE template). pin-remove had its own narrower guard already
+  // (mode !== 'pan' on the pin's own pointerdown handler), which only happened to mask this for
+  // the common case of removing a pin while in Move mode — covering it here too so removing a
+  // pin isn't quietly broken in every other mode.
+  if (e.target.closest('#turnOrderPanel, .obstacle-remove, .aoe-remove, .pin-remove')) return;
   if ((mode === 'pan' && e.target.closest('.pin')) || mode === 'no-map') return;
   hideDistancePanel();
   safeCapture(stage, e.pointerId);
