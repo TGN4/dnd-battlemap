@@ -141,7 +141,7 @@ app.post('/api/maps', requireBasicAuth, (req, res) => {
       name,
       file: `${id}.pdf`,
       scale: null, // pixels-per-foot, set by clicking two points a known distance apart
-      pins: [], // { id, type: 'player'|'monster', name, color, speed, attackRange, attackLongRange, hpMax, hpCurrent, conditions, hidden, wx, wy }
+      pins: [], // { id, type: 'player'|'monster', name, color, icon, speed, attackRange, attackLongRange, hpMax, hpCurrent, conditions, hidden, wx, wy }
       obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles; geometry visible to everyone, only the DM's marker box in the UI is hidden (see stateForConnection)
       templates: [], // { id, shape: 'cone'|'circle'|'line', x, y, angle, length, radius, width } — visible to everyone
       doors: [], // { id, x1, y1, x2, y2, open } — blocks LOS/movement like an obstacle edge while closed; DM-only to place/remove/toggle, geometry and open/closed state visible to everyone (same reasoning as obstacles — a door is not secret, only the authoring controls are)
@@ -370,10 +370,10 @@ function handleMessage(conn, msg) {
       if (!pin || !msg.patch) return;
       const keys = Object.keys(msg.patch);
       if (conn.role === 'player') {
-        // players may only touch their own pin, and only its current HP or conditions —
-        // name/type/colour/size/speed stay DM-only
+        // players may only touch their own pin, and only its current HP, conditions, or class
+        // icon — name/type/colour/size/speed stay DM-only
         if (conn.pinId !== msg.pinId) return;
-        if (!keys.every(k => k === 'hpCurrent' || k === 'conditions')) return;
+        if (!keys.every(k => k === 'hpCurrent' || k === 'conditions' || k === 'icon')) return;
       }
       Object.assign(pin, msg.patch);
       break;

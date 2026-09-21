@@ -145,6 +145,8 @@
     border-radius: 50%;
     border: 2px solid #fff;
     box-shadow: 0 1px 5px rgba(0,0,0,.6);
+    display: flex; align-items: center; justify-content: center;
+    line-height: 1;
   }
   .pin-player .pin-dot { background: var(--player); }
   .pin-monster .pin-dot { background: var(--monster); }
@@ -272,6 +274,14 @@
   .condition-chip input { margin: 0; accent-color: var(--accent); }
   .condition-chip.checked { border-color: var(--accent); background: rgba(91,106,245,.15); }
   .condition-chip:has(input:disabled) { cursor: default; opacity: .6; }
+  .icon-grid { display: flex; flex-wrap: wrap; gap: 5px; }
+  .icon-chip {
+    display: flex; align-items: center; justify-content: center;
+    width: 30px; height: 30px; cursor: pointer; font-size: 16px; line-height: 1;
+    background: #232636; border: 1px solid var(--border); border-radius: 6px;
+  }
+  .icon-chip.selected { border-color: var(--accent); background: rgba(91,106,245,.2); }
+  .icon-chip:disabled, .icon-chip.disabled { cursor: default; opacity: .5; }
   .link-btn {
     display: block; width: 100%; margin-bottom: 10px;
     background: none; border: 1px dashed var(--border); color: var(--muted);
@@ -327,6 +337,8 @@
   }
   #distancePanel button.dp-icon:hover { color: var(--text); }
   #distancePanel .dp-conditions:not(:empty) { margin: 8px 0; }
+  #distancePanel .dp-icon-grid:not(:empty) { margin: 8px 0; }
+  #distancePanel .icon-chip { width: 26px; height: 26px; font-size: 14px; }
   #distancePanel ul { list-style: none; margin: 0; padding: 0; }
   #distancePanel li {
     display: flex; align-items: center; gap: 6px;
@@ -545,6 +557,10 @@
       </label>
     </div>
     <div class="field-group">
+      <div class="field-group-title">Icon</div>
+      <div id="pinDialogIcon" class="icon-grid"></div>
+    </div>
+    <div class="field-group">
       <div class="field-group-title">Conditions</div>
       <div id="pinDialogConditions" class="condition-grid"></div>
     </div>
@@ -600,6 +616,7 @@
       <button class="dp-icon" id="dpClose" title="Close">×</button>
     </span>
   </div>
+  <div id="dpIconPicker" class="icon-grid dp-icon-grid"></div>
   <div id="dpConditions" class="condition-grid dp-conditions"></div>
   <ul id="dpList"></ul>
 </div>
@@ -686,6 +703,7 @@ const pinDialogHpCurrent = document.getElementById('pinDialogHpCurrent');
 const pinDialogHpMax = document.getElementById('pinDialogHpMax');
 const pinDialogColor = document.getElementById('pinDialogColor');
 const pinDialogConditions = document.getElementById('pinDialogConditions');
+const pinDialogIcon = document.getElementById('pinDialogIcon');
 const statblockInput = document.getElementById('statblockInput');
 const btnImportStatblock = document.getElementById('btnImportStatblock');
 const pinTypePlayer  = document.getElementById('pinTypePlayer');
@@ -705,6 +723,7 @@ const dpHpRow           = document.getElementById('dpHpRow');
 const dpHpInput          = document.getElementById('dpHpInput');
 const dpHpMax             = document.getElementById('dpHpMax');
 const dpConditions        = document.getElementById('dpConditions');
+const dpIconPicker        = document.getElementById('dpIconPicker');
 const dpList           = document.getElementById('dpList');
 const dpClose           = document.getElementById('dpClose');
 const dpEdit             = document.getElementById('dpEdit');
@@ -748,6 +767,18 @@ const CONDITIONS = [
   { id: 'unconscious', label: 'Unconscious', icon: '💤' },
 ];
 const CONDITION_BY_ID = Object.fromEntries(CONDITIONS.map(c => [c.id, c]));
+
+// A small class/role flavour set — not tied to any rules mechanic, purely a visual pick shown
+// centered on the pin's dot. Covers common PC archetypes plus a few generic monster flavours,
+// since the DM can use the same picker for any pin. pin.icon stores the emoji itself (like
+// pin.color stores a hex string directly) rather than an id needing a lookup — there's no
+// other metadata attached to a choice here worth normalizing.
+const PIN_ICONS = [
+  ['⚔️', 'Fighter'], ['🏹', 'Ranger'], ['🔮', 'Wizard'], ['✨', 'Cleric'],
+  ['🗡️', 'Rogue'], ['🛡️', 'Paladin'], ['🪄', 'Sorcerer'], ['😈', 'Warlock'],
+  ['🎵', 'Bard'], ['👊', 'Monk'], ['🍃', 'Druid'], ['🪓', 'Barbarian'],
+  ['🐾', 'Beast'], ['💀', 'Undead'], ['🐉', 'Dragon'], ['👑', 'Boss'],
+];
 
 let state = { activeMapId: null, maps: {} }; // last-known server state
 let pins = [];              // working copy of the active map's pins
@@ -999,7 +1030,21 @@ function selectedConditions() {
     .filter(chip => chip.querySelector('input').checked)
     .map(chip => chip.dataset.id);
 }
-function askPinDetails({ title, name = '', type = 'player', color = null, size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null, conditions = [], attackRange = null, attackLongRange = null }) {
+// Single-select, unlike conditions — clicking the already-selected icon again clears it back
+// to "no icon" (a plain colour dot, today's default look).
+let pinDialogIconValue = '';
+function renderIconPicker(selected) {
+  pinDialogIconValue = selected || '';
+  pinDialogIcon.innerHTML = PIN_ICONS.map(([icon, label]) => `
+    <button type="button" class="icon-chip${icon === pinDialogIconValue ? ' selected' : ''}" data-icon="${icon}" title="${label}">${icon}</button>
+  `).join('');
+}
+pinDialogIcon.addEventListener('click', (e) => {
+  const btn = e.target.closest('.icon-chip');
+  if (!btn) return;
+  renderIconPicker(pinDialogIconValue === btn.dataset.icon ? '' : btn.dataset.icon);
+});
+function askPinDetails({ title, name = '', type = 'player', color = null, size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null, conditions = [], attackRange = null, attackLongRange = null, icon = '' }) {
   pinDialogTitle.textContent = title;
   pinDialogName.value = name;
   pinDialogSize.value = size;
@@ -1011,6 +1056,7 @@ function askPinDetails({ title, name = '', type = 'player', color = null, size =
   pinDialogType = type;
   pinDialogColor.value = color || defaultColorForType(type);
   renderConditionCheckboxes(conditions);
+  renderIconPicker(icon);
   updatePinTypeButtons();
   pinDialog.classList.remove('hidden');
   pinDialogName.focus();
@@ -1060,7 +1106,7 @@ pinDialogSave.addEventListener('click', () => {
   const hpCurrentRaw = pinDialogHpCurrent.value.trim();
   let hpCurrent = hpCurrentRaw ? clamp(parseFloat(hpCurrentRaw) || 0, 0, 9999) : null;
   if (hpMax != null && hpCurrent == null) hpCurrent = hpMax; // only max given — assume undamaged
-  closePinDialog({ name, type: pinDialogType, color: pinDialogColor.value, size, speed, hpMax, hpCurrent, conditions: selectedConditions(), attackRange, attackLongRange });
+  closePinDialog({ name, type: pinDialogType, color: pinDialogColor.value, size, speed, hpMax, hpCurrent, conditions: selectedConditions(), attackRange, attackLongRange, icon: pinDialogIconValue });
 });
 pinDialogName.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') pinDialogSave.click();
@@ -1487,6 +1533,19 @@ function showDistancePanel(pin, screenX, screenY) {
   } else {
     dpHpRow.classList.add('hidden');
   }
+  // Single-select, same permission as HP/conditions — a player may set their own pin's class
+  // icon, the DM any pin's. Clicking the already-selected icon again clears it.
+  dpIconPicker.innerHTML = PIN_ICONS.map(([icon, label]) => `
+    <button type="button" class="icon-chip${pin.icon === icon ? ' selected' : ''}${canEditHp ? '' : ' disabled'}" data-icon="${icon}" title="${label}"${canEditHp ? '' : ' disabled'}>${icon}</button>
+  `).join('');
+  dpIconPicker.onclick = canEditHp ? (e) => {
+    const btn = e.target.closest('.icon-chip');
+    if (!btn) return;
+    pin.icon = pin.icon === btn.dataset.icon ? '' : btn.dataset.icon;
+    dpIconPicker.querySelectorAll('.icon-chip').forEach(b => b.classList.toggle('selected', b.dataset.icon === pin.icon));
+    renderAllPins();
+    sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { icon: pin.icon } });
+  } : null;
   const pinConditions = new Set(pin.conditions || []);
   dpConditions.innerHTML = CONDITIONS.map(c => `
     <label class="condition-chip${pinConditions.has(c.id) ? ' checked' : ''}" data-id="${c.id}">
@@ -1529,7 +1588,7 @@ dpEdit.addEventListener('click', async () => {
   const pin = pins.find(p => p.id === currentPanelPinId);
   if (!pin) return;
   hideDistancePanel();
-  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, color: pin.color ?? null, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null, conditions: pin.conditions ?? [], attackRange: pin.attackRange ?? null, attackLongRange: pin.attackLongRange ?? null });
+  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, color: pin.color ?? null, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null, conditions: pin.conditions ?? [], attackRange: pin.attackRange ?? null, attackLongRange: pin.attackLongRange ?? null, icon: pin.icon ?? '' });
   if (!result) return;
   pin.name = result.name;
   pin.type = result.type;
@@ -1541,8 +1600,9 @@ dpEdit.addEventListener('click', async () => {
   pin.conditions = result.conditions;
   pin.attackRange = result.attackRange;
   pin.attackLongRange = result.attackLongRange;
+  pin.icon = result.icon;
   renderAllPins();
-  sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, color: pin.color, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent, conditions: pin.conditions, attackRange: pin.attackRange, attackLongRange: pin.attackLongRange } });
+  sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, color: pin.color, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent, conditions: pin.conditions, attackRange: pin.attackRange, attackLongRange: pin.attackLongRange, icon: pin.icon } });
 });
 // "Goblin" -> "Goblin 2" -> "Goblin 3"; bumps past any name already taken on this map, so
 // duplicating the same pin repeatedly (the common case — a DM adding a pack of goblins one
@@ -1563,7 +1623,7 @@ dpDuplicate.addEventListener('click', () => {
   // A fresh copy of the stat block, not a snapshot of this pin's current fight — full health,
   // no lingering conditions, offset a bit so it doesn't land exactly on top of the original.
   const copy = {
-    id: crypto.randomUUID(), type: pin.type, name, color: pin.color,
+    id: crypto.randomUUID(), type: pin.type, name, color: pin.color, icon: pin.icon,
     size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpMax,
     conditions: [], attackRange: pin.attackRange, attackLongRange: pin.attackLongRange,
     wx: pin.wx + 40, wy: pin.wy + 40,
@@ -1735,7 +1795,12 @@ function renderPin(pin) {
   const conditionsRow = conditions.length
     ? `<div class="pin-conditions">${conditions.map(c => `<span title="${c.label}">${c.icon}</span>`).join('')}</div>`
     : '';
-  el.innerHTML = `<div class="pin-dot" style="width:${diameter}px;height:${diameter}px;background:${pinColor(pin)}"></div>${hpBar}<div class="pin-label">${escapeHtml(pin.name)}${losTag}</div>${conditionsRow}${removeBtn}`;
+  // A class/role icon is purely a visual flourish on top of the colour, not a data field
+  // anything else reads — plain text content, sized relative to the dot so it scales with a
+  // pin's D&D size category the same way the dot itself does.
+  const iconContent = pin.icon ? escapeHtml(pin.icon) : '';
+  const iconStyle = pin.icon ? ` font-size:${Math.max(11, diameter * 0.52)}px` : '';
+  el.innerHTML = `<div class="pin-dot" style="width:${diameter}px;height:${diameter}px;background:${pinColor(pin)};${iconStyle}">${iconContent}</div>${hpBar}<div class="pin-label">${escapeHtml(pin.name)}${losTag}</div>${conditionsRow}${removeBtn}`;
   pinsLayer.appendChild(el);
 
   const removeEl = el.querySelector('.pin-remove');
@@ -2239,7 +2304,7 @@ async function handleStageClick(e) {
     const type = mode === 'add-player' ? 'player' : 'monster';
     const result = await askPinDetails({ title: `New ${type}`, type });
     if (!result) return;
-    const pin = { id: crypto.randomUUID(), type: result.type, name: result.name, color: result.color, size: result.size, speed: result.speed, hpMax: result.hpMax, hpCurrent: result.hpCurrent, conditions: result.conditions, attackRange: result.attackRange, attackLongRange: result.attackLongRange, wx: worldX, wy: worldY };
+    const pin = { id: crypto.randomUUID(), type: result.type, name: result.name, color: result.color, size: result.size, speed: result.speed, hpMax: result.hpMax, hpCurrent: result.hpCurrent, conditions: result.conditions, attackRange: result.attackRange, attackLongRange: result.attackLongRange, icon: result.icon, wx: worldX, wy: worldY };
     pins.push(pin);
     renderPin(pin);
     sendAction({ type: 'addPin', mapId: state.activeMapId, pin });
