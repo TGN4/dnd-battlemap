@@ -1836,12 +1836,14 @@ function endTouch(pointerId) {
 }
 
 stage.addEventListener('pointerdown', (e) => {
-  // turnOrderPanel lives inside #stage (so it can be positioned relative to the map), but its
-  // buttons (End turn, End combat) are their own UI, not part of the map surface — without this
-  // guard, a real pointerdown here still bubbles up and stage claims pointer capture for itself
-  // before the button's own click handler ever runs, silently swallowing the click (confirmed:
-  // e.target on the resulting click ends up retargeted to #stage, never reaching #btnEndTurn).
-  if (e.target.closest('#turnOrderPanel')) return;
+  // turnOrderPanel, obstacle-remove and aoe-remove all live inside #stage (so they can be
+  // positioned relative to the map), but they're their own UI, not part of the map surface —
+  // without this guard, a real pointerdown on any of them still bubbles up and stage claims
+  // pointer capture for itself before the control's own click handler ever runs, silently
+  // swallowing the click (confirmed: e.target on the resulting click ends up retargeted to
+  // #stage, never reaching the button — same failure mode for End turn, and for the × remove
+  // control on a solid area or an AoE template).
+  if (e.target.closest('#turnOrderPanel, .obstacle-remove, .aoe-remove')) return;
   if ((mode === 'pan' && e.target.closest('.pin')) || mode === 'no-map') return;
   hideDistancePanel();
   safeCapture(stage, e.pointerId);
