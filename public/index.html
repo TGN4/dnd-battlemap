@@ -127,6 +127,7 @@
   #doorsLayer .door-remove circle { fill: #20222c; stroke: var(--border); }
   #doorsLayer .door-remove text { fill: #fff; font-size: 11px; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
   #doorPreview .door-line { stroke: var(--door); stroke-width: 5; stroke-linecap: round; stroke-dasharray: 4 3; fill: none; }
+  #fogLayer { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
 
   #pinsLayer { position: absolute; left: 0; top: 0; }
   .pin {
@@ -459,6 +460,7 @@
     <svg id="attackRangeLayer"></svg>
     <svg id="measureLayer"></svg>
     <div id="pinsLayer"></div>
+    <svg id="fogLayer"></svg>
   </div>
   <div id="turnOrderPanel" class="hidden">
     <div class="to-header">
@@ -619,6 +621,7 @@ const templatesLayer = document.getElementById('templatesLayer');
 const templatePreview = document.getElementById('templatePreview');
 const doorsLayer = document.getElementById('doorsLayer');
 const doorPreview = document.getElementById('doorPreview');
+const fogLayer = document.getElementById('fogLayer');
 const placeholder = document.getElementById('placeholder');
 const statusEl    = document.getElementById('status');
 const fileInput   = document.getElementById('fileInput');
@@ -882,6 +885,7 @@ function applyRemoteState(newState) {
     renderObstacles();
     renderTemplates();
     renderDoors();
+    renderFog();
     populateMapSelect();
     updateToolbarState();
     renderTurnOrder();
@@ -1133,6 +1137,37 @@ function drawAttackRange(pin) {
     svg += `<polygon points="${visibilityPolygonPoints(pin.wx, pin.wy, longR, obstacles, doors)}" fill="none" stroke="var(--attack)" stroke-opacity="0.45" stroke-width="2" stroke-dasharray="5 4"/>`;
   }
   attackRangeLayer.innerHTML = svg;
+}
+
+// ── fog of war — live visibility only, no persisted "explored" memory (see the story this
+// was scoped from). Darkens everything outside the party's current shared vision: the union
+// of every player pin's visibility polygon (reusing visibilityPolygonPoints — the same
+// door-aware ray-casting attack range uses), rendered as an SVG mask so overlapping polygons
+// union for free rather than needing an actual geometric union computed by hand. Party vision
+// is shared (matches the existing monster-reveal model: any one player pin seeing a spot means
+// the whole party does) rather than each player only seeing their own. Distance-unlimited by
+// design — like the existing LOS/attack-range math, visibility is blocked only by geometry
+// (obstacles, closed doors), not by a vision-range stat nothing in this app tracks yet.
+// DM-only concept in reverse: the DM always sees the true, unfogged map — this only renders
+// for a player connection.
+const FOG_RADIUS = 100000; // far past any realistic map extent — geometry is the only limit
+function renderFog() {
+  if (myRole !== 'player' || !mapCanvas.width || !mapCanvas.height) { fogLayer.innerHTML = ''; return; }
+  const m = activeMap();
+  if (!m) { fogLayer.innerHTML = ''; return; }
+  const obstacles = m.obstacles || [];
+  const doors = m.doors || [];
+  const w = mapCanvas.width, h = mapCanvas.height;
+  // Each player pin punches its own hole in the mask; a map with no player pins placed yet
+  // (or none of them still there) renders fully dark, which is the correct "no vision" state.
+  const holes = pins
+    .filter(p => p.type === 'player')
+    .map(p => `<polygon points="${visibilityPolygonPoints(p.wx, p.wy, FOG_RADIUS, obstacles, doors)}" fill="black"/>`)
+    .join('');
+  fogLayer.innerHTML = `
+    <mask id="fogMask"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}</mask>
+    <rect x="0" y="0" width="${w}" height="${h}" fill="#05060a" fill-opacity="0.92" mask="url(#fogMask)"/>
+  `;
 }
 
 // ── initiative setup (DM builds/reorders the turn order before combat) ─
@@ -1553,6 +1588,7 @@ async function loadActiveMap() {
     renderObstacles();
     renderTemplates();
     renderDoors();
+    renderFog();
     setMode('no-map');
     updateToolbarState();
     renderTurnOrder();
@@ -1574,6 +1610,7 @@ async function loadActiveMap() {
     }
   }
   if (gen !== loadGen) return; // a newer loadActiveMap() call has since taken over
+  renderFog(); // after renderPdf so mapCanvas has this map's real dimensions, not the previous one's
   updateToolbarState();
   renderTurnOrder();
   setMode(m.scale ? 'pan' : 'set-scale');
@@ -1666,6 +1703,7 @@ function renderPin(pin) {
       el.style.left = pin.wx + 'px';
       el.style.top = pin.wy + 'px';
       drawAttackRange(pin);
+      if (pin.type === 'player') renderFog(); // live-updates for the dragging player's own screen; a no-op on the DM's (renderFog only ever renders for myRole==='player')
     };
     const onUp = (e2) => {
       safeRelease(el, e.pointerId);
