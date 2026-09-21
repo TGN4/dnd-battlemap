@@ -451,6 +451,8 @@
     <canvas id="mapCanvas"></canvas>
     <div id="obstaclesLayer"></div>
     <div id="obstaclePreview" class="hidden"></div>
+    <div id="pinsLayer"></div>
+    <svg id="fogLayer"></svg>
     <svg id="templatesLayer"></svg>
     <svg id="templatePreview" class="hidden"></svg>
     <svg id="doorsLayer"></svg>
@@ -459,8 +461,6 @@
     <svg id="rangeLayer"></svg>
     <svg id="attackRangeLayer"></svg>
     <svg id="measureLayer"></svg>
-    <div id="pinsLayer"></div>
-    <svg id="fogLayer"></svg>
   </div>
   <div id="turnOrderPanel" class="hidden">
     <div class="to-header">
@@ -1150,6 +1150,13 @@ function drawAttackRange(pin) {
 // (obstacles, closed doors), not by a vision-range stat nothing in this app tracks yet.
 // DM-only concept in reverse: the DM always sees the true, unfogged map — this only renders
 // for a player connection.
+//
+// #fogLayer sits in #world between #pinsLayer and #templatesLayer/#doorsLayer on purpose:
+// tokens (pins) paint before it, so fog visually covers them in the dark like the story asked
+// ("the solid objects themselves should remain visible" — doors, and AoE templates by the same
+// existing "visible to everyone" reasoning, paint AFTER fog instead, so a door or a spell
+// marker stays visible even sitting in unlit territory, the same way solid-area geometry has
+// never been treated as secret — only creatures/tokens are meant to disappear into the dark.
 const FOG_RADIUS = 100000; // far past any realistic map extent — geometry is the only limit
 function renderFog() {
   if (myRole !== 'player' || !mapCanvas.width || !mapCanvas.height) { fogLayer.innerHTML = ''; return; }
