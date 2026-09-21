@@ -810,9 +810,10 @@ function segmentsIntersect(p1, p2, p3, p4) {
   const d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
   return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
-function pathBlocked(fromWx, fromWy, toWx, toWy) {
-  const m = activeMap();
-  const obstacles = m?.obstacles || [];
+// Parameterized so fog rendering can ask "is this obstacle's own footprint visible" by
+// excluding that one obstacle from the blocker list — pathBlocked() itself always checks
+// against the full active-map list.
+function segmentBlockedBy(fromWx, fromWy, toWx, toWy, obstacles, doors) {
   const pa = { x: fromWx, y: fromWy }, pb = { x: toWx, y: toWy };
   for (const o of obstacles) {
     const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
@@ -820,11 +821,15 @@ function pathBlocked(fromWx, fromWy, toWx, toWy) {
       if (segmentsIntersect(pa, pb, c[i], c[(i + 1) % 4])) return true;
     }
   }
-  for (const d of m?.doors || []) {
+  for (const d of doors) {
     if (d.open) continue;
     if (segmentsIntersect(pa, pb, { x: d.x1, y: d.y1 }, { x: d.x2, y: d.y2 })) return true;
   }
   return false;
+}
+function pathBlocked(fromWx, fromWy, toWx, toWy) {
+  const m = activeMap();
+  return segmentBlockedBy(fromWx, fromWy, toWx, toWy, m?.obstacles || [], m?.doors || []);
 }
 function remainingSpeed(pin) {
   const m = activeMap();
@@ -1165,14 +1170,33 @@ function renderFog() {
   const obstacles = m.obstacles || [];
   const doors = m.doors || [];
   const w = mapCanvas.width, h = mapCanvas.height;
+  const playerPins = pins.filter(p => p.type === 'player');
   // Each player pin punches its own hole in the mask; a map with no player pins placed yet
   // (or none of them still there) renders fully dark, which is the correct "no vision" state.
-  const holes = pins
-    .filter(p => p.type === 'player')
+  const holes = playerPins
     .map(p => `<polygon points="${visibilityPolygonPoints(p.wx, p.wy, FOG_RADIUS, obstacles, doors)}" fill="black"/>`)
     .join('');
+  // The ray-casting shadow above stops exactly at an obstacle's NEAR face — correct for what's
+  // BEHIND it, but that leaves the obstacle's own footprint (the tree itself, right next to
+  // you) sitting just outside the lit polygon and getting darkened, which looks wrong up close:
+  // you can see the tree you're standing next to, just not what's past it. So separately punch
+  // a hole for the full footprint of any obstacle whose near side is actually in view — tested
+  // by checking LOS from a player pin to each corner/center, against every OTHER obstacle (not
+  // itself, which would trivially "block" a ray ending on its own edge) and all closed doors.
+  const visibleObstacleHoles = obstacles
+    .filter(o => {
+      const others = obstacles.filter(x => x !== o);
+      const probes = [
+        { x: o.x, y: o.y }, { x: o.x + o.w, y: o.y },
+        { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h },
+        { x: o.x + o.w / 2, y: o.y + o.h / 2 },
+      ];
+      return playerPins.some(p => probes.some(pt => !segmentBlockedBy(p.wx, p.wy, pt.x, pt.y, others, doors)));
+    })
+    .map(o => `<rect x="${o.x}" y="${o.y}" width="${o.w}" height="${o.h}" fill="black"/>`)
+    .join('');
   fogLayer.innerHTML = `
-    <mask id="fogMask"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}</mask>
+    <mask id="fogMask"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}${visibleObstacleHoles}</mask>
     <rect x="0" y="0" width="${w}" height="${h}" fill="#05060a" fill-opacity="0.92" mask="url(#fogMask)"/>
   `;
 }
