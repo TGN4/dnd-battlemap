@@ -144,6 +144,7 @@ app.post('/api/maps', requireBasicAuth, (req, res) => {
       pins: [], // { id, type: 'player'|'monster', name, color, speed, attackRange, attackLongRange, hpMax, hpCurrent, conditions, hidden, wx, wy }
       obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles; geometry visible to everyone, only the DM's marker box in the UI is hidden (see stateForConnection)
       templates: [], // { id, shape: 'cone'|'circle'|'line', x, y, angle, length, radius, width } — visible to everyone
+      doors: [], // { id, x1, y1, x2, y2, open } — blocks LOS/movement like an obstacle edge while closed; DM-only to place/remove/toggle, geometry and open/closed state visible to everyone (same reasoning as obstacles — a door is not secret, only the authoring controls are)
       initiative: defaultInitiative(),
     };
     state.activeMapId = id;
@@ -178,13 +179,19 @@ function segmentsIntersect(p1, p2, p3, p4) {
   const d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
   return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
-function hasLOS(a, b, obstacles) {
+// A closed door blocks like an obstacle edge; an open one blocks nothing — same segment-
+// intersection test, just a single segment per door instead of 4 per rectangle.
+function hasLOS(a, b, obstacles, doors) {
   const pa = { x: a.wx, y: a.wy }, pb = { x: b.wx, y: b.wy };
   for (const o of obstacles) {
     const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
     for (let i = 0; i < 4; i++) {
       if (segmentsIntersect(pa, pb, c[i], c[(i + 1) % 4])) return false;
     }
+  }
+  for (const d of doors || []) {
+    if (d.open) continue;
+    if (segmentsIntersect(pa, pb, { x: d.x1, y: d.y1 }, { x: d.x2, y: d.y2 })) return false;
   }
   return true;
 }
@@ -223,8 +230,8 @@ function stateForConnection(conn) {
     const playerPins = map.pins.filter(p => p.type === 'player');
     const myPin = map.pins.find(p => p.id === conn.pinId);
     const pins = map.pins
-      .filter(p => p.type !== 'monster' || playerPins.some(pp => hasLOS(pp, p, map.obstacles)))
-      .map(p => p.type !== 'monster' ? p : { ...p, losFromMe: !!myPin && hasLOS(myPin, p, map.obstacles) });
+      .filter(p => p.type !== 'monster' || playerPins.some(pp => hasLOS(pp, p, map.obstacles, map.doors)))
+      .map(p => p.type !== 'monster' ? p : { ...p, losFromMe: !!myPin && hasLOS(myPin, p, map.obstacles, map.doors) });
     maps[id] = { ...map, pins };
   }
   return { ...state, maps };
@@ -331,7 +338,7 @@ function handleMessage(conn, msg) {
       // from). Reuses the same hasLOS check LOS filtering uses — "does a straight line cross
       // any obstacle edge" is exactly what both need. The DM is exempt — walls constrain
       // players, not the DM repositioning a pin for story/staging reasons.
-      if (conn.role !== 'dm' && !hasLOS(pin, { wx: msg.wx, wy: msg.wy }, map.obstacles)) return;
+      if (conn.role !== 'dm' && !hasLOS(pin, { wx: msg.wx, wy: msg.wy }, map.obstacles, map.doors)) return;
 
       let wx = msg.wx, wy = msg.wy;
       if (conn.role === 'player' && isActiveTurn && pin.speed && map.scale) {
@@ -393,6 +400,34 @@ function handleMessage(conn, msg) {
       const idx = map.obstacles.findIndex(o => o.id === msg.obstacleId);
       if (idx === -1) return;
       map.obstacles.splice(idx, 1);
+      break;
+    }
+    case 'addDoor': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      const d = msg.door;
+      if (!map || !d) return;
+      if (!map.doors) map.doors = [];
+      map.doors.push({ id: d.id || crypto.randomUUID(), x1: d.x1, y1: d.y1, x2: d.x2, y2: d.y2, open: false });
+      break;
+    }
+    case 'removeDoor': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      if (!map?.doors) return;
+      const idx = map.doors.findIndex(d => d.id === msg.doorId);
+      if (idx === -1) return;
+      map.doors.splice(idx, 1);
+      break;
+    }
+    case 'toggleDoor': {
+      // DM-only for now, matching every other authoring/control action — see the "Doors"
+      // story for the open question about letting a player toggle a door near their own pin.
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      const door = map?.doors?.find(d => d.id === msg.doorId);
+      if (!door) return;
+      door.open = !door.open;
       break;
     }
     case 'addTemplate': {
