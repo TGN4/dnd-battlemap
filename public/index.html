@@ -154,15 +154,16 @@
   .pin-no-los .pin-dot { opacity: .4; }
   .pin-no-los .pin-label { opacity: .7; }
   .pin-no-los-tag {
-    color: var(--measure); font-weight: 700; text-transform: uppercase; font-size: 9px;
+    color: var(--measure); font-weight: 700; text-transform: uppercase; font-size: 11px;
     letter-spacing: .03em;
   }
   .pin-label {
     margin-top: 3px;
-    font-size: 11px;
-    background: rgba(0,0,0,.72);
+    font-size: 14px;
+    font-weight: 600;
+    background: rgba(0,0,0,.78);
     color: #fff;
-    padding: 1px 6px;
+    padding: 2px 8px;
     border-radius: 4px;
     white-space: nowrap;
     pointer-events: none;
@@ -287,12 +288,12 @@
   .pin-hpfill { height: 100%; }
 
   .pin-conditions {
-    display: flex; flex-wrap: wrap; justify-content: center; gap: 1px;
-    max-width: 70px; margin-top: 2px; pointer-events: none;
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 2px;
+    max-width: 84px; margin-top: 2px; pointer-events: none;
   }
   .pin-conditions span {
-    font-size: 11px; line-height: 1; background: rgba(0,0,0,.72);
-    border-radius: 3px; padding: 1px 2px;
+    font-size: 13px; line-height: 1; background: rgba(0,0,0,.72);
+    border-radius: 3px; padding: 2px 3px;
   }
 
   #distancePanel {
@@ -393,6 +394,13 @@
     background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
     padding: 10px 12px; width: 220px; box-shadow: 0 4px 16px rgba(0,0,0,.5); z-index: 8;
   }
+  /* A player's own hint that it's their turn — the panel itself is easy to overlook otherwise,
+     especially glancing at a phone/tablet mid-conversation at the table. */
+  @keyframes turnPulse {
+    0%, 100% { box-shadow: 0 4px 16px rgba(0,0,0,.5), 0 0 0 0 rgba(91,106,245,.55); }
+    50% { box-shadow: 0 4px 16px rgba(0,0,0,.5), 0 0 0 9px rgba(91,106,245,0); }
+  }
+  #turnOrderPanel.my-turn { border-color: var(--accent); animation: turnPulse 1.8s ease-in-out infinite; }
   #turnOrderPanel .to-header {
     display: flex; align-items: center; justify-content: space-between;
     font-size: 13px; font-weight: 600; margin-bottom: 6px;
@@ -745,6 +753,7 @@ let state = { activeMapId: null, maps: {} }; // last-known server state
 let pins = [];              // working copy of the active map's pins
 let mode = 'no-map';        // 'no-map' | 'set-scale' | 'pan' | 'add-player' | 'add-monster' | 'measure'
 let booted = false;         // has the first state arrived (over the websocket) yet
+let wasMyTurn = false;      // tracks the rising edge into "it's my turn" so the toast fires once, not on every re-render
 
 let panX = 0, panY = 0, zoom = 1;  // view transform (world/map px -> screen) — local to this browser, never synced
 
@@ -1393,6 +1402,15 @@ function renderTurnOrder() {
 
   const myTurn = myRole === 'dm' || (myRole === 'player' && entry?.pinIds.includes(myPinId));
   btnEndTurn.classList.toggle('hidden', !myTurn);
+
+  // A player's own visible cue that it's their turn — DM already sees/controls the whole order
+  // directly, so this is player-only. Pulses the panel for as long as it's their turn, plus a
+  // one-shot toast on the moment it BECOMES their turn (not re-fired on every render while it
+  // stays their turn, and also fires on reconnecting mid-their-own-turn, which is useful too).
+  const isMyPlayerTurn = myRole === 'player' && !!entry?.pinIds.includes(myPinId);
+  turnOrderPanel.classList.toggle('my-turn', isMyPlayerTurn);
+  if (isMyPlayerTurn && !wasMyTurn) showToast("It's your turn!");
+  wasMyTurn = isMyPlayerTurn;
 
   // Persistent dashed range indicator for a solo active entry (skipped for grouped entries
   // to avoid overlapping circles) — distinct from the solid transient one used on click/drag.
