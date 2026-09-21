@@ -1106,27 +1106,37 @@ function rayIntersectsSegment(ox, oy, dx, dy, e1, e2) {
   if (t >= 0 && s >= 0 && s <= 1) return t;
   return null;
 }
-function visibilityPolygonPoints(ox, oy, radius, obstacles, doors = [], steps = 144) {
+// Shared core for both the polygon shape and (for fog) which obstacles actually cast part of
+// its boundary — tracking that alongside the ray-cast itself, rather than a separate check
+// afterward, means "is this obstacle part of the shadow edge" can never disagree with what the
+// shadow actually looks like, however many other obstacles are in the scene.
+function castVisibility(ox, oy, radius, obstacles, doors, steps) {
   const points = [];
+  const hitObstacles = new Set();
   for (let i = 0; i < steps; i++) {
     const angle = (i / steps) * Math.PI * 2;
     const dx = Math.cos(angle), dy = Math.sin(angle);
     let dist = radius;
+    let hitObstacle = null;
     for (const o of obstacles) {
       const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
       for (let j = 0; j < 4; j++) {
         const t = rayIntersectsSegment(ox, oy, dx, dy, c[j], c[(j + 1) % 4]);
-        if (t !== null && t < dist) dist = t;
+        if (t !== null && t < dist) { dist = t; hitObstacle = o; }
       }
     }
     for (const d of doors) {
       if (d.open) continue;
       const t = rayIntersectsSegment(ox, oy, dx, dy, { x: d.x1, y: d.y1 }, { x: d.x2, y: d.y2 });
-      if (t !== null && t < dist) dist = t;
+      if (t !== null && t < dist) { dist = t; hitObstacle = null; } // a door isn't an obstacle rectangle to highlight this way
     }
+    if (hitObstacle) hitObstacles.add(hitObstacle);
     points.push(`${ox + dx * dist},${oy + dy * dist}`);
   }
-  return points.join(' ');
+  return { points: points.join(' '), hitObstacles };
+}
+function visibilityPolygonPoints(ox, oy, radius, obstacles, doors = [], steps = 144) {
+  return castVisibility(ox, oy, radius, obstacles, doors, steps).points;
 }
 function clearAttackRange() { attackRangeLayer.innerHTML = ''; }
 function drawAttackRange(pin) {
@@ -1173,26 +1183,24 @@ function renderFog() {
   const playerPins = pins.filter(p => p.type === 'player');
   // Each player pin punches its own hole in the mask; a map with no player pins placed yet
   // (or none of them still there) renders fully dark, which is the correct "no vision" state.
+  // The ray-casting shadow stops exactly at an obstacle's NEAR face — correct for what's BEHIND
+  // it, but that leaves the obstacle's own footprint (the tree itself, right next to you)
+  // sitting just outside the lit polygon and getting darkened, which looks wrong up close: you
+  // can see the tree you're standing next to, just not what's past it. So every obstacle that
+  // castVisibility actually stopped a ray on (collected from the very same ray-cast that draws
+  // the shadow, not a separate check that could disagree with it — a first attempt using
+  // discrete corner probes turned out too fragile once other obstacles on a busy real map could
+  // block a probe ray that wasn't actually relevant) gets its own full footprint punched as an
+  // extra hole too.
+  const visibleObstacles = new Set();
   const holes = playerPins
-    .map(p => `<polygon points="${visibilityPolygonPoints(p.wx, p.wy, FOG_RADIUS, obstacles, doors)}" fill="black"/>`)
-    .join('');
-  // The ray-casting shadow above stops exactly at an obstacle's NEAR face — correct for what's
-  // BEHIND it, but that leaves the obstacle's own footprint (the tree itself, right next to
-  // you) sitting just outside the lit polygon and getting darkened, which looks wrong up close:
-  // you can see the tree you're standing next to, just not what's past it. So separately punch
-  // a hole for the full footprint of any obstacle whose near side is actually in view — tested
-  // by checking LOS from a player pin to each corner/center, against every OTHER obstacle (not
-  // itself, which would trivially "block" a ray ending on its own edge) and all closed doors.
-  const visibleObstacleHoles = obstacles
-    .filter(o => {
-      const others = obstacles.filter(x => x !== o);
-      const probes = [
-        { x: o.x, y: o.y }, { x: o.x + o.w, y: o.y },
-        { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h },
-        { x: o.x + o.w / 2, y: o.y + o.h / 2 },
-      ];
-      return playerPins.some(p => probes.some(pt => !segmentBlockedBy(p.wx, p.wy, pt.x, pt.y, others, doors)));
+    .map(p => {
+      const { points, hitObstacles } = castVisibility(p.wx, p.wy, FOG_RADIUS, obstacles, doors, 144);
+      hitObstacles.forEach(o => visibleObstacles.add(o));
+      return `<polygon points="${points}" fill="black"/>`;
     })
+    .join('');
+  const visibleObstacleHoles = [...visibleObstacles]
     .map(o => `<rect x="${o.x}" y="${o.y}" width="${o.w}" height="${o.h}" fill="black"/>`)
     .join('');
   fogLayer.innerHTML = `
