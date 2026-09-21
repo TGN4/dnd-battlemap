@@ -61,6 +61,35 @@ function resetTraveled(map, entry) {
   for (const pinId of entry.pinIds) map.initiative.traveled[pinId] = 0;
 }
 
+// ── basic auth ───────────────────────────────────────────────────────
+// Opt-in: unset APP_PASSWORD (the default for local dev) disables auth entirely, so nothing
+// changes for local testing. Set it (and optionally APP_USERNAME) once this is deployed
+// somewhere public, so a stranger who finds the URL can't rack up hosting costs — the
+// expensive operation is the map upload (up to 100MB), so that's the one that most needs
+// gating, along with the DM page itself and the raw state dump.
+//
+// Player links (/play/:pinId) stay open on purpose — sharing the link *is* the access
+// control there, same as it's always been; requiring the DM's password too would break the
+// whole point of a just-send-a-link flow.
+const APP_USERNAME = process.env.APP_USERNAME || 'dm';
+const APP_PASSWORD = process.env.APP_PASSWORD || '';
+function checkBasicAuth(req) {
+  if (!APP_PASSWORD) return true;
+  const header = req.headers.authorization || '';
+  const [scheme, encoded] = header.split(' ');
+  if (scheme !== 'Basic' || !encoded) return false;
+  let decoded;
+  try { decoded = Buffer.from(encoded, 'base64').toString('utf8'); } catch { return false; }
+  const sep = decoded.indexOf(':');
+  if (sep === -1) return false;
+  return decoded.slice(0, sep) === APP_USERNAME && decoded.slice(sep + 1) === APP_PASSWORD;
+}
+function requireBasicAuth(req, res, next) {
+  if (checkBasicAuth(req)) return next();
+  res.set('WWW-Authenticate', 'Basic realm="DnD Battlemap DM"');
+  res.status(401).send('Authentication required.');
+}
+
 const upload = multer({
   storage: multer.diskStorage({
     destination: uploadsDir,
@@ -79,18 +108,25 @@ const upload = multer({
 
 const app = express();
 app.use(express.json());
+app.get('/', requireBasicAuth, (_req, res) => {
+  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+});
 app.get('/play/:pinId', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
-app.use(express.static(path.join(__dirname, 'public')));
+// No express.static(public) here on purpose — the only file in public/ is index.html, and
+// it's served explicitly above (with auth on the DM route, without on the player route);
+// a blanket static mount would let /index.html bypass that split entirely.
 app.use('/uploads', express.static(uploadsDir));
 app.use('/vendor/pdfjs', express.static(path.join(__dirname, 'node_modules/pdfjs-dist/build')));
 
-app.get('/api/state', (_req, res) => {
+app.get('/api/state', requireBasicAuth, (_req, res) => {
   res.json(state);
 });
 
-app.post('/api/maps', (req, res) => {
+app.post('/api/maps', requireBasicAuth, (req, res) => {
+  // Auth runs before multer touches the request body, so an unauthenticated request never
+  // gets far enough to have a large file written to disk in the first place.
   upload.single('map')(req, res, (err) => {
     if (err) {
       const message = err.code === 'LIMIT_FILE_SIZE' ? 'PDF is too large (max 100MB).' : (err.message || 'Import failed.');
@@ -117,7 +153,7 @@ app.post('/api/maps', (req, res) => {
   });
 });
 
-app.delete('/api/maps/:id', (req, res) => {
+app.delete('/api/maps/:id', requireBasicAuth, (req, res) => {
   const map = state.maps[req.params.id];
   if (!map) return res.status(404).json({ error: 'Map not found.' });
 
@@ -154,15 +190,19 @@ function hasLOS(a, b, obstacles) {
 }
 
 // ── realtime layer ────────────────────────────────────────────────────
-// Every connection is either the DM (full control) or a player linked to one
-// pin id (can only move/adjust-HP on that pin). This split is what lets
-// stateForConnection() below filter what's broadcast to whom without any
-// further data-model changes: pins already carry a `hidden` flag (unused
-// today, always false) for a future fog-of-war feature to use the same way.
-const clients = new Set(); // { ws, role: 'dm'|'player', pinId: string|null }
+// Every connection is either the DM (full control), a player linked to one pin id (can only
+// move/adjust-HP on that pin), or — new since basic auth — unauthenticated (role stays null:
+// they asked for 'dm' over the websocket without a valid Authorization header, see the
+// 'hello' handler below). This split is what lets stateForConnection() below filter what's
+// broadcast to whom without any further data-model changes: pins already carry a `hidden`
+// flag (unused today, always false) for a future fog-of-war feature to use the same way.
+const clients = new Set(); // { ws, role: 'dm'|'player'|null, pinId: string|null, authenticatedDm: boolean }
 
 function stateForConnection(conn) {
-  if (conn.role !== 'player') return state;
+  // Explicit allow-list for the one privileged case, rather than a deny-list on 'player' —
+  // an unauthenticated connection (role null) must fall through to the filtered branch below
+  // exactly like a player does, not get the unfiltered state by default.
+  if (conn.role === 'dm') return state;
   const maps = {};
   for (const [id, map] of Object.entries(state.maps)) {
     // Obstacle geometry itself isn't secret — a tree is a tree, players can see it's an
@@ -218,8 +258,19 @@ function findPin(mapId, pinId) {
 function handleMessage(conn, msg) {
   switch (msg.type) {
     case 'hello': {
-      conn.role = msg.role === 'player' ? 'player' : 'dm';
-      conn.pinId = conn.role === 'player' ? msg.pinId : null;
+      // A client claiming 'dm' only actually becomes one if this connection's upgrade
+      // request carried valid basic-auth credentials (conn.authenticatedDm, set once at
+      // connection time — see wss.on('connection') below); otherwise role stays null,
+      // which every other handler already treats as unprivileged (see stateForConnection,
+      // movePin, and editPin for the three spots that needed an explicit check rather than
+      // assuming "not player" meant "must be dm").
+      if (msg.role === 'player') {
+        conn.role = 'player';
+        conn.pinId = msg.pinId;
+      } else {
+        conn.role = conn.authenticatedDm ? 'dm' : null;
+        conn.pinId = null;
+      }
       send(conn, { type: 'state', state: stateForConnection(conn) });
       return;
     }
@@ -258,6 +309,10 @@ function handleMessage(conn, msg) {
       break;
     }
     case 'movePin': {
+      // Explicit: an unauthenticated connection (role null — see 'hello') is neither dm nor
+      // player and gets no move privileges at all, rather than silently falling through to
+      // full dm-level access because it isn't 'player'.
+      if (conn.role !== 'dm' && conn.role !== 'player') return;
       const map = state.maps[msg.mapId];
       const { pin } = findPin(msg.mapId, msg.pinId);
       if (!map || !pin) return;
@@ -300,6 +355,9 @@ function handleMessage(conn, msg) {
       break;
     }
     case 'editPin': {
+      // Same explicit check as movePin — an unauthenticated connection is neither dm nor
+      // player and must not fall through to unrestricted edit access.
+      if (conn.role !== 'dm' && conn.role !== 'player') return;
       const { pin } = findPin(msg.mapId, msg.pinId);
       if (!pin || !msg.patch) return;
       const keys = Object.keys(msg.patch);
@@ -452,8 +510,15 @@ function handleMessage(conn, msg) {
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server, path: '/ws' });
 
-wss.on('connection', (ws) => {
-  const conn = { ws, role: null, pinId: null };
+wss.on('connection', (ws, req) => {
+  // The websocket handshake is still a plain HTTP request under the hood, so a browser that
+  // already has basic-auth credentials cached for this origin (from loading the DM page at
+  // '/', which requires them) automatically resends the same Authorization header here too —
+  // no separate password prompt needed. A player's browser, having only ever loaded the
+  // unprotected /play/:pinId route, never has credentials cached and so never sends this
+  // header; that's fine, since claiming 'player' in 'hello' never required it anyway.
+  const authenticatedDm = checkBasicAuth(req);
+  const conn = { ws, role: null, pinId: null, authenticatedDm };
   clients.add(conn);
   ws.on('message', (raw) => {
     let msg;
