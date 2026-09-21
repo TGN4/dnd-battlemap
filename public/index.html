@@ -763,6 +763,9 @@ function canDragNow(pin) {
 // clamping against the remaining budget (speed minus however much was already moved
 // this turn) lets a move → action → move-again sequence still add up to one total speed.
 function clampToSpeed(pin, wx, wy, anchor) {
+  // The DM can reposition any pin anywhere, any time, for story/staging reasons — the speed
+  // budget only constrains a player moving their own pin on their own turn.
+  if (myRole !== 'player') return { wx, wy };
   if (!isActiveTurnPin(pin)) return { wx, wy };
   const m = activeMap();
   if (!pin.speed || !m?.scale) return { wx, wy };
@@ -1617,8 +1620,10 @@ function renderPin(pin) {
       // A solid area blocks the move outright rather than sliding to contact (see the story
       // this was scoped from) — so a candidate whose straight line from the drag's start
       // would cross one is simply not applied, leaving the pin at its last legal position
-      // this drag reached instead of snapping all the way back to where it started.
-      if (!pathBlocked(dragAnchor.wx, dragAnchor.wy, raw.wx, raw.wy)) {
+      // this drag reached instead of snapping all the way back to where it started. The DM is
+      // exempt — walls are there to constrain players, not to stop the DM repositioning a pin
+      // for story/staging reasons.
+      if (myRole === 'dm' || !pathBlocked(dragAnchor.wx, dragAnchor.wy, raw.wx, raw.wy)) {
         pin.wx = raw.wx;
         pin.wy = raw.wy;
       }
@@ -1634,7 +1639,7 @@ function renderPin(pin) {
         clearRange();
         clearAttackRange();
         const m = activeMap();
-        if (m?.initiative && isActiveTurnPin(pin)) {
+        if (myRole === 'player' && m?.initiative && isActiveTurnPin(pin)) {
           const segDist = Math.hypot(pin.wx - origWx, pin.wy - origWy);
           m.initiative.traveled[pin.id] = (m.initiative.traveled[pin.id] || 0) + segDist;
           renderTurnOrder();

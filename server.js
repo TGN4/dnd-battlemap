@@ -329,11 +329,12 @@ function handleMessage(conn, msg) {
       // whose turn it is. First pass: reject the whole move if its straight line crosses one,
       // rather than sliding the pin to the point of contact (see the story this was built
       // from). Reuses the same hasLOS check LOS filtering uses — "does a straight line cross
-      // any obstacle edge" is exactly what both need.
-      if (!hasLOS(pin, { wx: msg.wx, wy: msg.wy }, map.obstacles)) return;
+      // any obstacle edge" is exactly what both need. The DM is exempt — walls constrain
+      // players, not the DM repositioning a pin for story/staging reasons.
+      if (conn.role !== 'dm' && !hasLOS(pin, { wx: msg.wx, wy: msg.wy }, map.obstacles)) return;
 
       let wx = msg.wx, wy = msg.wy;
-      if (isActiveTurn && pin.speed && map.scale) {
+      if (conn.role === 'player' && isActiveTurn && pin.speed && map.scale) {
         // Clamp against the REMAINING budget (total speed minus what's already been moved
         // this turn), anchored to the pin's current position — not a fresh speed's worth
         // measured from wherever the turn began — so a move → action → move again sequence
