@@ -18,6 +18,7 @@
     --measure: #f5a623;
     --obstacle: #a78bfa;
     --template: #38bdf8;
+    --attack: #fb7185;
   }
   * { box-sizing: border-box; }
   html, body { height: 100%; margin: 0; }
@@ -106,7 +107,7 @@
   #world { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
   #mapCanvas { position: absolute; left: 0; top: 0; display: block; }
 
-  #turnRangeLayer, #rangeLayer, #measureLayer { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+  #turnRangeLayer, #rangeLayer, #attackRangeLayer, #measureLayer { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
   #templatesLayer, #templatePreview { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
   #templatesLayer .aoe-shape { pointer-events: auto; cursor: pointer; fill: var(--template); fill-opacity: .22; stroke: var(--template); stroke-width: 2; }
   #templatesLayer .aoe-remove { pointer-events: auto; cursor: pointer; }
@@ -439,6 +440,7 @@
     <svg id="templatePreview" class="hidden"></svg>
     <svg id="turnRangeLayer"></svg>
     <svg id="rangeLayer"></svg>
+    <svg id="attackRangeLayer"></svg>
     <svg id="measureLayer"></svg>
     <div id="pinsLayer"></div>
   </div>
@@ -498,6 +500,14 @@
       </label>
       <label>Speed (ft/turn)
         <input type="number" id="pinDialogSpeed" min="0" step="5">
+      </label>
+    </div>
+    <div class="field-row">
+      <label>Attack range (ft)
+        <input type="number" id="pinDialogAttackRange" min="0" step="5" placeholder="—">
+      </label>
+      <label>Long range (ft)
+        <input type="number" id="pinDialogAttackLongRange" min="0" step="5" placeholder="ranged only">
       </label>
     </div>
     <div class="field-row">
@@ -583,6 +593,7 @@ const stage       = document.getElementById('stage');
 const world       = document.getElementById('world');
 const mapCanvas   = document.getElementById('mapCanvas');
 const rangeLayer  = document.getElementById('rangeLayer');
+const attackRangeLayer = document.getElementById('attackRangeLayer');
 const pinsLayer   = document.getElementById('pinsLayer');
 const measureLayer= document.getElementById('measureLayer');
 const obstaclesLayer=document.getElementById('obstaclesLayer');
@@ -638,6 +649,8 @@ const pinDialogTitle = document.getElementById('pinDialogTitle');
 const pinDialogName  = document.getElementById('pinDialogName');
 const pinDialogSize  = document.getElementById('pinDialogSize');
 const pinDialogSpeed = document.getElementById('pinDialogSpeed');
+const pinDialogAttackRange = document.getElementById('pinDialogAttackRange');
+const pinDialogAttackLongRange = document.getElementById('pinDialogAttackLongRange');
 const pinDialogHpCurrent = document.getElementById('pinDialogHpCurrent');
 const pinDialogHpMax = document.getElementById('pinDialogHpMax');
 const pinDialogColor = document.getElementById('pinDialogColor');
@@ -760,10 +773,10 @@ function clampToSpeed(pin, wx, wy, anchor) {
   return { wx: anchor.wx + dx * ratio, wy: anchor.wy + dy * ratio };
 }
 // Mirrors the server's obstacle-blocking check for the same jank-free-drag reason as
-// clampToSpeed above. A player's client never receives obstacles at all (DM-only data, see
-// stateForConnection in server.js) — for them this always sees an empty list and never blocks
-// locally; the server still enforces it, and since broadcasts now reach the sender too, an
-// illegal move a player's client didn't know to stop gets corrected within one round trip.
+// clampToSpeed above. Every connection receives real obstacle geometry (see
+// stateForConnection in server.js — it was never actually secret, only the DM's marker box
+// is), so this blocks locally for a player exactly as it does for the DM, not just on the
+// server's say-so after the fact.
 function segmentsIntersect(p1, p2, p3, p4) {
   const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
   const d1 = cross(p3, p4, p1), d2 = cross(p3, p4, p2);
@@ -938,11 +951,13 @@ function selectedConditions() {
     .filter(chip => chip.querySelector('input').checked)
     .map(chip => chip.dataset.id);
 }
-function askPinDetails({ title, name = '', type = 'player', color = null, size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null, conditions = [] }) {
+function askPinDetails({ title, name = '', type = 'player', color = null, size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null, conditions = [], attackRange = null, attackLongRange = null }) {
   pinDialogTitle.textContent = title;
   pinDialogName.value = name;
   pinDialogSize.value = size;
   pinDialogSpeed.value = speed;
+  pinDialogAttackRange.value = attackRange ?? '';
+  pinDialogAttackLongRange.value = attackLongRange ?? '';
   pinDialogHpCurrent.value = hpCurrent ?? '';
   pinDialogHpMax.value = hpMax ?? '';
   pinDialogType = type;
@@ -988,12 +1003,16 @@ pinDialogSave.addEventListener('click', () => {
   if (!name) return;
   const speed = clamp(parseFloat(pinDialogSpeed.value) || 0, 0, 1000);
   const size = pinDialogSize.value;
+  const attackRangeRaw = pinDialogAttackRange.value.trim();
+  const attackRange = attackRangeRaw ? clamp(parseFloat(attackRangeRaw) || 0, 0, 5000) : null;
+  const attackLongRangeRaw = pinDialogAttackLongRange.value.trim();
+  const attackLongRange = attackRange != null && attackLongRangeRaw ? clamp(parseFloat(attackLongRangeRaw) || 0, 0, 5000) : null;
   const hpMaxRaw = pinDialogHpMax.value.trim();
   const hpMax = hpMaxRaw ? clamp(parseFloat(hpMaxRaw) || 0, 0, 9999) : null;
   const hpCurrentRaw = pinDialogHpCurrent.value.trim();
   let hpCurrent = hpCurrentRaw ? clamp(parseFloat(hpCurrentRaw) || 0, 0, 9999) : null;
   if (hpMax != null && hpCurrent == null) hpCurrent = hpMax; // only max given — assume undamaged
-  closePinDialog({ name, type: pinDialogType, color: pinDialogColor.value, size, speed, hpMax, hpCurrent, conditions: selectedConditions() });
+  closePinDialog({ name, type: pinDialogType, color: pinDialogColor.value, size, speed, hpMax, hpCurrent, conditions: selectedConditions(), attackRange, attackLongRange });
 });
 pinDialogName.addEventListener('keydown', (e) => {
   if (e.key === 'Enter') pinDialogSave.click();
@@ -1025,6 +1044,58 @@ function drawRange(pin) {
   const r = rs ? rs.remaining : pin.speed * scale;
   const color = pin.type === 'player' ? 'var(--player)' : 'var(--monster)';
   rangeLayer.innerHTML = `<circle cx="${pin.wx}" cy="${pin.wy}" r="${r}" fill="${color}" fill-opacity="0.18" stroke="${color}" stroke-opacity="0.55" stroke-width="2"/>`;
+}
+
+// ── attack range (shown alongside movement range for the selected pin) ─
+// A plain circle isn't right here — a solid area should block line of fire the same way it
+// blocks line of sight, so this casts a ray outward at each of `steps` evenly-spaced angles
+// and stops it at the nearest obstacle edge (or the full range, if nothing's in the way),
+// then connects the resulting points into a polygon. Not a true visibility polygon (no
+// precise ray-to-corner alignment, just a dense angular sample) — a close approximation that's
+// far simpler to get right, and smooth enough at normal zoom levels with 144 sample points.
+//
+// Every connection receives real obstacle geometry now (see stateForConnection in server.js —
+// it was never actually secret, only the DM's marker box is), so this is equally accurate
+// whoever's viewing it: a player's own client can ray-cast their own pin's attack range
+// against the same walls the DM sees, not just a plain unblocked circle.
+function rayIntersectsSegment(ox, oy, dx, dy, e1, e2) {
+  const sx = e2.x - e1.x, sy = e2.y - e1.y;
+  const denom = dx * sy - dy * sx;
+  if (Math.abs(denom) < 1e-10) return null; // parallel
+  const t = ((e1.x - ox) * sy - (e1.y - oy) * sx) / denom;
+  const s = ((e1.x - ox) * dy - (e1.y - oy) * dx) / denom;
+  if (t >= 0 && s >= 0 && s <= 1) return t;
+  return null;
+}
+function visibilityPolygonPoints(ox, oy, radius, obstacles, steps = 144) {
+  const points = [];
+  for (let i = 0; i < steps; i++) {
+    const angle = (i / steps) * Math.PI * 2;
+    const dx = Math.cos(angle), dy = Math.sin(angle);
+    let dist = radius;
+    for (const o of obstacles) {
+      const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
+      for (let j = 0; j < 4; j++) {
+        const t = rayIntersectsSegment(ox, oy, dx, dy, c[j], c[(j + 1) % 4]);
+        if (t !== null && t < dist) dist = t;
+      }
+    }
+    points.push(`${ox + dx * dist},${oy + dy * dist}`);
+  }
+  return points.join(' ');
+}
+function clearAttackRange() { attackRangeLayer.innerHTML = ''; }
+function drawAttackRange(pin) {
+  const scale = activeMap()?.scale;
+  if (!scale || !pin.attackRange || !showSpeedInfo(pin)) { clearAttackRange(); return; }
+  const obstacles = activeMap()?.obstacles || [];
+  const normalR = pin.attackRange * scale;
+  let svg = `<polygon points="${visibilityPolygonPoints(pin.wx, pin.wy, normalR, obstacles)}" fill="var(--attack)" fill-opacity="0.10" stroke="var(--attack)" stroke-opacity="0.7" stroke-width="2"/>`;
+  if (pin.attackLongRange) {
+    const longR = pin.attackLongRange * scale;
+    svg += `<polygon points="${visibilityPolygonPoints(pin.wx, pin.wy, longR, obstacles)}" fill="none" stroke="var(--attack)" stroke-opacity="0.45" stroke-width="2" stroke-dasharray="5 4"/>`;
+  }
+  attackRangeLayer.innerHTML = svg;
 }
 
 // ── initiative setup (DM builds/reorders the turn order before combat) ─
@@ -1219,10 +1290,11 @@ btnStopCombat.addEventListener('click', async () => {
 });
 
 // ── distances-on-click panel ──────────────────────────────────────────
-function hideDistancePanel() { distancePanel.classList.add('hidden'); currentPanelPinId = null; clearRange(); }
+function hideDistancePanel() { distancePanel.classList.add('hidden'); currentPanelPinId = null; clearRange(); clearAttackRange(); }
 function showDistancePanel(pin, screenX, screenY) {
   currentPanelPinId = pin.id;
   drawRange(pin);
+  drawAttackRange(pin);
   const scale = activeMap()?.scale || 1;
   const rows = pins
     .filter(p => p.id !== pin.id)
@@ -1295,7 +1367,7 @@ dpEdit.addEventListener('click', async () => {
   const pin = pins.find(p => p.id === currentPanelPinId);
   if (!pin) return;
   hideDistancePanel();
-  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, color: pin.color ?? null, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null, conditions: pin.conditions ?? [] });
+  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, color: pin.color ?? null, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null, conditions: pin.conditions ?? [], attackRange: pin.attackRange ?? null, attackLongRange: pin.attackLongRange ?? null });
   if (!result) return;
   pin.name = result.name;
   pin.type = result.type;
@@ -1305,8 +1377,10 @@ dpEdit.addEventListener('click', async () => {
   pin.hpMax = result.hpMax;
   pin.hpCurrent = result.hpCurrent;
   pin.conditions = result.conditions;
+  pin.attackRange = result.attackRange;
+  pin.attackLongRange = result.attackLongRange;
   renderAllPins();
-  sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, color: pin.color, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent, conditions: pin.conditions } });
+  sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { name: pin.name, type: pin.type, color: pin.color, size: pin.size, speed: pin.speed, hpMax: pin.hpMax, hpCurrent: pin.hpCurrent, conditions: pin.conditions, attackRange: pin.attackRange, attackLongRange: pin.attackLongRange } });
 });
 window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
@@ -1502,6 +1576,7 @@ function renderPin(pin) {
     const origWx = pin.wx, origWy = pin.wy;
     const dragAnchor = { wx: origWx, wy: origWy };
     drawRange(pin); // shown locked at the starting position for the whole drag, as a reference for how far the pin can move
+    drawAttackRange(pin); // this one follows the pin instead — see onMove — since it's about where you end up, not where you started
     let moved = false;
     const onMove = (e2) => {
       const dx = e2.clientX - startX, dy = e2.clientY - startY;
@@ -1517,6 +1592,7 @@ function renderPin(pin) {
       }
       el.style.left = pin.wx + 'px';
       el.style.top = pin.wy + 'px';
+      drawAttackRange(pin);
     };
     const onUp = (e2) => {
       safeRelease(el, e.pointerId);
@@ -1524,6 +1600,7 @@ function renderPin(pin) {
       el.removeEventListener('pointerup', onUp);
       if (moved) {
         clearRange();
+        clearAttackRange();
         const m = activeMap();
         if (m?.initiative && isActiveTurnPin(pin)) {
           const segDist = Math.hypot(pin.wx - origWx, pin.wy - origWy);
@@ -1549,7 +1626,12 @@ function renderAllPins() {
 // for now this is just the authoring tool, and only the DM can see or edit them) ───────
 function renderObstacles() {
   obstaclesLayer.innerHTML = '';
-  if (myRole !== 'dm') return; // defensive — the server already omits them from a player's state
+  // The DM-only marker box (this rendering) is what stays hidden, not the underlying data —
+  // the server sends real obstacle geometry to everyone now (it was never actually secret,
+  // a tree is visibly a tree on the map), which is what lets a player's own client predict
+  // movement-blocking and compute their own attack-range shape locally. Only the authoring
+  // overlay itself is DM-only.
+  if (myRole !== 'dm') return;
   const list = activeMap()?.obstacles || [];
   list.forEach(o => {
     const el = document.createElement('div');
@@ -1859,7 +1941,7 @@ async function handleStageClick(e) {
     const type = mode === 'add-player' ? 'player' : 'monster';
     const result = await askPinDetails({ title: `New ${type}`, type });
     if (!result) return;
-    const pin = { id: crypto.randomUUID(), type: result.type, name: result.name, color: result.color, size: result.size, speed: result.speed, hpMax: result.hpMax, hpCurrent: result.hpCurrent, conditions: result.conditions, wx: worldX, wy: worldY };
+    const pin = { id: crypto.randomUUID(), type: result.type, name: result.name, color: result.color, size: result.size, speed: result.speed, hpMax: result.hpMax, hpCurrent: result.hpCurrent, conditions: result.conditions, attackRange: result.attackRange, attackLongRange: result.attackLongRange, wx: worldX, wy: worldY };
     pins.push(pin);
     renderPin(pin);
     sendAction({ type: 'addPin', mapId: state.activeMapId, pin });

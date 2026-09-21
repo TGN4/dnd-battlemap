@@ -105,8 +105,8 @@ app.post('/api/maps', (req, res) => {
       name,
       file: `${id}.pdf`,
       scale: null, // pixels-per-foot, set by clicking two points a known distance apart
-      pins: [], // { id, type: 'player'|'monster', name, color, speed, hpMax, hpCurrent, conditions, hidden, wx, wy }
-      obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles, DM-only for now (see stateForConnection)
+      pins: [], // { id, type: 'player'|'monster', name, color, speed, attackRange, attackLongRange, hpMax, hpCurrent, conditions, hidden, wx, wy }
+      obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles; geometry visible to everyone, only the DM's marker box in the UI is hidden (see stateForConnection)
       templates: [], // { id, shape: 'cone'|'circle'|'line', x, y, angle, length, radius, width } — visible to everyone
       initiative: defaultInitiative(),
     };
@@ -165,20 +165,27 @@ function stateForConnection(conn) {
   if (conn.role !== 'player') return state;
   const maps = {};
   for (const [id, map] of Object.entries(state.maps)) {
-    // Obstacle markings themselves are a DM-only authoring layer — a player never sees the
-    // rectangles, only their effect (below). A monster pin is only sent to a player at all if
-    // SOME player pin has line of sight to it (shared party vision: once the party can see a
-    // monster, everyone in the party knows it's there). Separately, each monster pin sent
-    // carries `losFromMe`: whether THIS player's own pin specifically has a clear line to it —
-    // shared vision can reveal a monster's existence without this player being able to target
-    // it themselves (e.g. a teammate down the hall spots it around a corner this player can't
-    // see past), and that distinction has to be visible in the UI for targeting decisions.
+    // Obstacle geometry itself isn't secret — a tree is a tree, players can see it's an
+    // obstacle right there on the map image — so the raw rectangles are sent to everyone.
+    // What stays DM-only is purely the authoring marker (the hatched box + remove control):
+    // renderObstacles() in index.html gates that rendering on role, not this. Sending the
+    // real geometry to players is also what lets their own client predict movement-blocking
+    // and compute their own attack-range shape locally, instead of only finding out from a
+    // server rejection after the fact.
+    //
+    // A monster pin is only sent to a player at all if SOME player pin has line of sight to
+    // it (shared party vision: once the party can see a monster, everyone in the party knows
+    // it's there). Separately, each monster pin sent carries `losFromMe`: whether THIS
+    // player's own pin specifically has a clear line to it — shared vision can reveal a
+    // monster's existence without this player being able to target it themselves (e.g. a
+    // teammate down the hall spots it around a corner this player can't see past), and that
+    // distinction has to be visible in the UI for targeting decisions.
     const playerPins = map.pins.filter(p => p.type === 'player');
     const myPin = map.pins.find(p => p.id === conn.pinId);
     const pins = map.pins
       .filter(p => p.type !== 'monster' || playerPins.some(pp => hasLOS(pp, p, map.obstacles)))
       .map(p => p.type !== 'monster' ? p : { ...p, losFromMe: !!myPin && hasLOS(myPin, p, map.obstacles) });
-    maps[id] = { ...map, obstacles: [], pins };
+    maps[id] = { ...map, pins };
   }
   return { ...state, maps };
 }
