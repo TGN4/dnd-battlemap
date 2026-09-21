@@ -1173,6 +1173,35 @@ function drawAttackRange(pin) {
 // marker stays visible even sitting in unlit territory, the same way solid-area geometry has
 // never been treated as secret — only creatures/tokens are meant to disappear into the dark.
 const FOG_RADIUS = 100000; // far past any realistic map extent — geometry is the only limit
+// DMs building an organic-looking feature (a bush, a rock pile) out of this tool's only
+// primitive — axis-aligned rectangles — place several overlapping/adjacent ones together (16
+// obstacles on the real campaign map turned out to be 6 such clusters of 2-3 plus 3 singles).
+// From one specific viewing angle, one piece of a cluster can fully eclipse another piece
+// directly behind it, so a per-obstacle "was this one hit by a ray" check only reveals whatever
+// sliver happens to face the viewer — not "the whole tree", which is what it actually looks
+// like standing next to it. So obstacles are grouped once here (any two that overlap or sit
+// within a small pad of each other join the same cluster), and revealing any single piece of a
+// cluster reveals every piece in it.
+function clusterObstacles(obstacles) {
+  const PAD = 20; // world px — small gap a DM might have left between pieces of one feature
+  const overlapsOrTouches = (a, b) =>
+    !(a.x + a.w + PAD < b.x || b.x + b.w + PAD < a.x || a.y + a.h + PAD < b.y || b.y + b.h + PAD < a.y);
+  const clusterOf = new Map(); // obstacle -> array (its full cluster, itself included)
+  const visited = new Set();
+  obstacles.forEach(o => {
+    if (visited.has(o)) return;
+    const cluster = [o];
+    visited.add(o);
+    for (let i = 0; i < cluster.length; i++) {
+      obstacles.forEach(o2 => {
+        if (visited.has(o2)) return;
+        if (overlapsOrTouches(cluster[i], o2)) { cluster.push(o2); visited.add(o2); }
+      });
+    }
+    cluster.forEach(member => clusterOf.set(member, cluster));
+  });
+  return clusterOf;
+}
 function renderFog() {
   if (myRole !== 'player' || !mapCanvas.width || !mapCanvas.height) { fogLayer.innerHTML = ''; return; }
   const m = activeMap();
@@ -1181,6 +1210,7 @@ function renderFog() {
   const doors = m.doors || [];
   const w = mapCanvas.width, h = mapCanvas.height;
   const playerPins = pins.filter(p => p.type === 'player');
+  const clusterOf = clusterObstacles(obstacles);
   // Each player pin punches its own hole in the mask; a map with no player pins placed yet
   // (or none of them still there) renders fully dark, which is the correct "no vision" state.
   // The ray-casting shadow stops exactly at an obstacle's NEAR face — correct for what's BEHIND
@@ -1188,23 +1218,26 @@ function renderFog() {
   // sitting just outside the lit polygon and getting darkened, which looks wrong up close: you
   // can see the tree you're standing next to, just not what's past it. So every obstacle that
   // castVisibility actually stopped a ray on (collected from the very same ray-cast that draws
-  // the shadow, not a separate check that could disagree with it — a first attempt using
-  // discrete corner probes turned out too fragile once other obstacles on a busy real map could
-  // block a probe ray that wasn't actually relevant) gets its own full footprint punched as an
-  // extra hole too.
+  // the shadow, not a separate check that could disagree with it) — and, per the clustering
+  // above, everything else grouped with it — gets its own full footprint punched as a hole too.
   const visibleObstacles = new Set();
   const holes = playerPins
     .map(p => {
       const { points, hitObstacles } = castVisibility(p.wx, p.wy, FOG_RADIUS, obstacles, doors, 144);
-      hitObstacles.forEach(o => visibleObstacles.add(o));
+      hitObstacles.forEach(o => (clusterOf.get(o) || [o]).forEach(x => visibleObstacles.add(x)));
       return `<polygon points="${points}" fill="black"/>`;
     })
     .join('');
   const visibleObstacleHoles = [...visibleObstacles]
     .map(o => `<rect x="${o.x}" y="${o.y}" width="${o.w}" height="${o.h}" fill="black"/>`)
     .join('');
+  // A soft feather on every fog edge (the vision boundary and the obstacle cutouts alike) reads
+  // less like a hard vector cutout and more like actual fading visibility — one blur on the
+  // whole mask covers both at once.
+  const blur = Math.max(6, (m.scale || 20) * 0.5);
   fogLayer.innerHTML = `
-    <mask id="fogMask"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}${visibleObstacleHoles}</mask>
+    <filter id="fogBlur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="${blur}"/></filter>
+    <mask id="fogMask"><g filter="url(#fogBlur)"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}${visibleObstacleHoles}</g></mask>
     <rect x="0" y="0" width="${w}" height="${h}" fill="#05060a" fill-opacity="0.92" mask="url(#fogMask)"/>
   `;
 }
