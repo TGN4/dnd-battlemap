@@ -66,6 +66,8 @@
   /* Player links hide DM-only controls — same underlying page, reduced UI. */
   body.player-mode #mapSelect,
   body.player-mode #btnImport,
+  body.player-mode #btnExportMap,
+  body.player-mode #btnImportMap,
   body.player-mode #btnDeleteMap,
   body.player-mode #btnSetScale,
   body.player-mode #btnAddPlayer,
@@ -236,6 +238,18 @@
     font-size: 13px;
   }
   .modal-overlay .actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 12px; }
+  #rosterDialog .box { width: min(300px, 92vw); }
+  .dialog-hint { color: var(--muted); margin-bottom: 10px !important; }
+  .roster-list { display: flex; flex-direction: column; gap: 6px; max-height: 240px; overflow-y: auto; }
+  .roster-item {
+    display: flex; align-items: center; gap: 8px; width: 100%; text-align: left;
+    background: #232636; border: 1px solid var(--border); border-radius: 6px;
+    padding: 7px 9px; cursor: pointer; font-size: 13px; color: var(--text);
+  }
+  .roster-item:hover { border-color: var(--accent); }
+  .roster-item .roster-icon { font-size: 15px; width: 18px; text-align: center; flex: none; }
+  .roster-item .roster-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .roster-item .roster-hp { color: var(--muted); font-size: 11px; flex: none; }
   .type-toggle { display: flex; gap: 6px; margin-top: 8px; align-items: stretch; }
   .type-toggle button { flex: 1; }
   .type-toggle input[type=color] {
@@ -449,6 +463,9 @@
   <select id="mapSelect"><option value="">No maps yet</option></select>
   <input type="file" id="fileInput" accept="application/pdf" hidden>
   <button id="btnImport">+ New map</button>
+  <button id="btnExportMap" disabled title="Export this map (pins, terrain, and background PDF) as a file">Export map</button>
+  <input type="file" id="mapImportFileInput" accept="application/json,.json" hidden>
+  <button id="btnImportMap" title="Import a previously-exported map file">Import map</button>
   <button id="btnDeleteMap" disabled title="Delete this map">🗑</button>
   <div class="sep"></div>
   <button id="btnSetScale" disabled>Set scale</button>
@@ -606,6 +623,18 @@
   </div>
 </div>
 
+<div id="rosterDialog" class="modal-overlay hidden">
+  <div class="box">
+    <h2>Add player</h2>
+    <p class="dialog-hint">Place a character already in the roster, or create a new one.</p>
+    <div id="rosterList" class="roster-list"></div>
+    <button type="button" id="rosterNewCharacter" class="link-btn">+ New character</button>
+    <div class="actions">
+      <button id="rosterCancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div id="distancePanel" class="hidden">
   <div class="dp-header">
     <div>
@@ -634,10 +663,18 @@
 import * as pdfjsLib from '/vendor/pdfjs/pdf.min.mjs';
 pdfjsLib.GlobalWorkerOptions.workerSrc = '/vendor/pdfjs/pdf.worker.min.mjs';
 
-// ── role: DM (default, at /) or a player linked to one pin (at /play/<pinId>) ─
+// ── role: DM (default, at /) or a player linked to one character (at /play/<characterId>) ─
+// A character (identity/stats — name, HP, conditions, icon, ...) is campaign-level, not tied
+// to any one map; this id follows the player across every map their character is placed on.
+// Each map only holds a lightweight token ({id, type:'player', characterId, wx, wy}) marking
+// where that character currently is on THAT map — see resolvePin() server-side, which overlays
+// the character's fields onto its token before sending state, so everywhere below that reads
+// pin.name/hpCurrent/icon/etc keeps working exactly as it did before this split; only the
+// handful of spots that care about identity itself (this file's grep for myCharacterId) needed
+// to change from comparing pin.id to comparing pin.characterId.
 const playMatch = location.pathname.match(/^\/play\/([^/?#]+)/);
 const myRole = playMatch ? 'player' : 'dm';
-const myPinId = playMatch ? decodeURIComponent(playMatch[1]) : null;
+const myCharacterId = playMatch ? decodeURIComponent(playMatch[1]) : null;
 if (myRole === 'player') document.body.classList.add('player-mode');
 
 const stage       = document.getElementById('stage');
@@ -660,6 +697,9 @@ const fileInput   = document.getElementById('fileInput');
 const mapSelect   = document.getElementById('mapSelect');
 
 const btnImport   = document.getElementById('btnImport');
+const btnExportMap = document.getElementById('btnExportMap');
+const btnImportMap = document.getElementById('btnImportMap');
+const mapImportFileInput = document.getElementById('mapImportFileInput');
 const btnDeleteMap= document.getElementById('btnDeleteMap');
 const btnSetScale = document.getElementById('btnSetScale');
 const btnPan      = document.getElementById('btnPan');
@@ -724,6 +764,11 @@ const confirmDialog  = document.getElementById('confirmDialog');
 const confirmMessage = document.getElementById('confirmMessage');
 const confirmCancel  = document.getElementById('confirmCancel');
 const confirmOk      = document.getElementById('confirmOk');
+
+const rosterDialog       = document.getElementById('rosterDialog');
+const rosterList         = document.getElementById('rosterList');
+const rosterNewCharacter = document.getElementById('rosterNewCharacter');
+const rosterCancel       = document.getElementById('rosterCancel');
 
 const distancePanel = document.getElementById('distancePanel');
 const dpTitle        = document.getElementById('dpTitle');
@@ -794,6 +839,10 @@ const PIN_ICONS = [
 let state = { activeMapId: null, maps: {} }; // last-known server state
 let pins = [];              // working copy of the active map's pins
 let mode = 'no-map';        // 'no-map' | 'set-scale' | 'pan' | 'add-player' | 'add-monster' | 'measure'
+// Set only when the DM picked an existing roster character from askCharacterPlacement() —
+// the next 'add-player' map click places a new token for THIS character instead of opening
+// the full "new player" dialog. Cleared on placement, or on switching to any other tool.
+let pendingPlaceCharacterId = null;
 let booted = false;         // has the first state arrived (over the websocket) yet
 let wasMyTurn = false;      // tracks the rising edge into "it's my turn" so the toast fires once, not on every re-render
 
@@ -816,7 +865,7 @@ function safeCapture(el, id) { try { el.setPointerCapture(id); } catch {} }
 function safeRelease(el, id) { try { el.releasePointerCapture(id); } catch {} }
 function escapeHtml(s) { const d = document.createElement('div'); d.textContent = s ?? ''; return d.innerHTML; }
 function activeMap() { return state.activeMapId ? state.maps[state.activeMapId] : null; }
-function canControlPin(pin) { return myRole === 'dm' || (myRole === 'player' && myPinId === pin.id); }
+function canControlPin(pin) { return myRole === 'dm' || (myRole === 'player' && myCharacterId === pin.characterId); }
 
 // ── turn-based combat helpers ──────────────────────────────────────────
 function activeEntry() {
@@ -994,7 +1043,7 @@ function connectSocket() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   socket = new WebSocket(`${proto}://${location.host}/ws`);
   socket.addEventListener('open', () => {
-    socket.send(JSON.stringify({ type: 'hello', role: myRole, pinId: myPinId }));
+    socket.send(JSON.stringify({ type: 'hello', role: myRole, characterId: myCharacterId }));
   });
   socket.addEventListener('message', (e) => {
     let msg;
@@ -1030,7 +1079,9 @@ function applyRemoteState(newState) {
     if (m && m.scale && mode === 'set-scale') setMode('pan');
   }
   if (myRole === 'player') {
-    const exists = activeMap()?.pins?.some(p => p.id === myPinId);
+    // Still a real, valid state even with the character roster — it just means the DM hasn't
+    // placed this character on the currently-active map (yet), not that anything is broken.
+    const exists = activeMap()?.pins?.some(p => p.type === 'player' && p.characterId === myCharacterId);
     if (!exists && !missingPinWarned) {
       missingPinWarned = true;
       showToast("Your character isn't on this map — check your link with the DM.");
@@ -1102,8 +1153,40 @@ scaleDialogInput.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') closeScaleDialog(null);
 });
 
+// ── roster picker (shown before "add player" once at least one character exists) ──
+// Placing an existing character (a new token pointing at the same characterId) is the whole
+// point of the character/map split — it carries HP/conditions/icon over automatically, instead
+// of recreating them from scratch on every map. Resolves to a characterId to place, the
+// sentinel '__new__' to fall through to the ordinary askPinDetails create flow, or null/undefined
+// on cancel.
+let rosterDialogResolve = null;
+function askCharacterPlacement() {
+  const characters = Object.values(state.characters || {});
+  rosterList.innerHTML = characters.map(c => `
+    <button type="button" class="roster-item" data-id="${c.id}">
+      <span class="roster-icon">${c.icon || '🧑'}</span>
+      <span class="roster-name">${escapeHtml(c.name)}</span>
+      ${c.hpMax != null ? `<span class="roster-hp">${c.hpCurrent ?? c.hpMax}/${c.hpMax} HP</span>` : ''}
+    </button>
+  `).join('');
+  rosterDialog.classList.remove('hidden');
+  return new Promise((resolve) => { rosterDialogResolve = resolve; });
+}
+function closeRosterDialog(value) {
+  rosterDialog.classList.add('hidden');
+  if (rosterDialogResolve) { rosterDialogResolve(value); rosterDialogResolve = null; }
+}
+rosterList.addEventListener('click', (e) => {
+  const btn = e.target.closest('.roster-item');
+  if (!btn) return;
+  closeRosterDialog(btn.dataset.id);
+});
+rosterNewCharacter.addEventListener('click', () => closeRosterDialog('__new__'));
+rosterCancel.addEventListener('click', () => closeRosterDialog(null));
+
 // ── pin dialog (create + edit: name, type, colour, size, speed, conditions) ──
 let pinDialogType = 'player';
+let pinDialogTypeLocked = false;
 let pinDialogResolve = null;
 function renderConditionCheckboxes(selected) {
   const sel = new Set(selected || []);
@@ -1136,7 +1219,12 @@ pinDialogIcon.addEventListener('click', (e) => {
   if (!btn) return;
   renderIconPicker(pinDialogIconValue === btn.dataset.icon ? '' : btn.dataset.icon);
 });
-function askPinDetails({ title, name = '', type = 'player', color = null, size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null, conditions = [], attackRange = null, attackLongRange = null, icon = '' }) {
+// `locked` disables the type toggle — used when editing an EXISTING pin, since type decides
+// whether a pin has a character record behind it (see server.js's editPin) and converting
+// between the two shapes mid-flight isn't supported; the server already silently drops a type
+// change in an edit patch, but locking the control here avoids the confusing flash of a client-
+// side-only type flip that then snaps back once the next state broadcast corrects it.
+function askPinDetails({ title, name = '', type = 'player', color = null, size = DEFAULT_SIZE, speed = DEFAULT_SPEED, hpCurrent = null, hpMax = null, conditions = [], attackRange = null, attackLongRange = null, icon = '', locked = false }) {
   pinDialogTitle.textContent = title;
   pinDialogName.value = name;
   pinDialogSize.value = size;
@@ -1146,6 +1234,7 @@ function askPinDetails({ title, name = '', type = 'player', color = null, size =
   pinDialogHpCurrent.value = hpCurrent ?? '';
   pinDialogHpMax.value = hpMax ?? '';
   pinDialogType = type;
+  pinDialogTypeLocked = locked;
   pinDialogColor.value = color || defaultColorForType(type);
   renderConditionCheckboxes(conditions);
   renderIconPicker(icon);
@@ -1173,6 +1262,10 @@ statblockInput.addEventListener('change', async () => {
 function updatePinTypeButtons() {
   pinTypePlayer.classList.toggle('active', pinDialogType === 'player');
   pinTypeMonster.classList.toggle('active', pinDialogType === 'monster');
+  pinTypePlayer.disabled = pinDialogTypeLocked;
+  pinTypeMonster.disabled = pinDialogTypeLocked;
+  pinTypePlayer.title = pinDialogTypeLocked ? "Type can't be changed after a pin is created." : '';
+  pinTypeMonster.title = pinTypePlayer.title;
 }
 function closePinDialog(value) {
   pinDialog.classList.add('hidden');
@@ -1181,8 +1274,8 @@ function closePinDialog(value) {
 // Switching type resets the colour swatch to that type's default — a deliberate simplicity
 // tradeoff: tracking "did the user deliberately customize this" wasn't worth it for how
 // rarely someone would toggle type after already picking a custom colour.
-pinTypePlayer.addEventListener('click', () => { pinDialogType = 'player'; pinDialogColor.value = defaultColorForType('player'); updatePinTypeButtons(); });
-pinTypeMonster.addEventListener('click', () => { pinDialogType = 'monster'; pinDialogColor.value = defaultColorForType('monster'); updatePinTypeButtons(); });
+pinTypePlayer.addEventListener('click', () => { if (pinDialogTypeLocked) return; pinDialogType = 'player'; pinDialogColor.value = defaultColorForType('player'); updatePinTypeButtons(); });
+pinTypeMonster.addEventListener('click', () => { if (pinDialogTypeLocked) return; pinDialogType = 'monster'; pinDialogColor.value = defaultColorForType('monster'); updatePinTypeButtons(); });
 pinDialogCancel.addEventListener('click', () => closePinDialog(null));
 pinDialogSave.addEventListener('click', () => {
   const name = pinDialogName.value.trim();
@@ -1351,20 +1444,64 @@ const FOG_RADIUS = 100000; // far past any realistic map extent — geometry is 
 // From one specific viewing angle, one piece of a cluster can fully eclipse another piece
 // directly behind it, so a per-zone "was this one hit by a ray" check only reveals whatever
 // sliver happens to face the viewer — not "the whole tree", which is what it actually looks
-// like standing next to it. So blocksLOS zones are grouped once here (any two whose bounding
-// boxes overlap or sit within a small pad of each other join the same cluster), and revealing
-// any single piece of a cluster reveals every piece in it.
+// like standing next to it. So blocksLOS zones are grouped once here, and revealing any single
+// piece of a cluster reveals every piece in it.
+//
+// Clustering has to be by actual shape proximity, not bounding-box proximity: an early version
+// used "bounding boxes overlap or sit within a small pad," which merges any two zones whose
+// bounding boxes happen to be close — for organic blob-shaped polygons (a tree canopy, say)
+// the box can extend well past the visible shape, so two entirely separate trees a few
+// squares apart got merged into one reveal-cluster, defeating normal occlusion between them
+// (Thomas: trees a DM placed as separate obstacles were staying fully lit even when a nearer
+// tree should have been blocking sight to them — see the screenshot this was fixed from).
+// zoneBounds is now only a cheap pre-filter to skip the precise check for zones that are
+// obviously far apart; polygonsCloseOrOverlapping does the real, shape-accurate test.
 function zoneBounds(zone) {
   const xs = zone.points.map(p => p.x), ys = zone.points.map(p => p.y);
   return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
 }
+function pointToSegmentDist(px, py, ax, ay, bx, by) {
+  const dx = bx - ax, dy = by - ay;
+  const lenSq = dx * dx + dy * dy;
+  let t = lenSq === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
+}
+// True only if the two polygons actually overlap (edges cross, or one fully contains the
+// other) or their nearest edges sit within `pad` of each other — never merely because their
+// bounding boxes are close.
+function polygonsCloseOrOverlapping(a, b, pad) {
+  const ap = a.points, bp = b.points;
+  for (let i = 0; i < ap.length; i++) {
+    const a1 = ap[i], a2 = ap[(i + 1) % ap.length];
+    for (let j = 0; j < bp.length; j++) {
+      if (segmentsIntersect(a1, a2, bp[j], bp[(j + 1) % bp.length])) return true;
+    }
+  }
+  if (pointInPolygon(ap[0].x, ap[0].y, bp) || pointInPolygon(bp[0].x, bp[0].y, ap)) return true;
+  let minDist = Infinity;
+  for (const v of ap) {
+    for (let j = 0; j < bp.length; j++) {
+      const b1 = bp[j], b2 = bp[(j + 1) % bp.length];
+      minDist = Math.min(minDist, pointToSegmentDist(v.x, v.y, b1.x, b1.y, b2.x, b2.y));
+    }
+  }
+  for (const v of bp) {
+    for (let i = 0; i < ap.length; i++) {
+      const a1 = ap[i], a2 = ap[(i + 1) % ap.length];
+      minDist = Math.min(minDist, pointToSegmentDist(v.x, v.y, a1.x, a1.y, a2.x, a2.y));
+    }
+  }
+  return minDist <= pad;
+}
 function clusterZones(zones) {
   const PAD = 20; // world px — small gap a DM might have left between pieces of one feature
   const bounds = new Map(zones.map(z => [z, zoneBounds(z)]));
-  const overlapsOrTouches = (a, b) => {
+  const mightBeClose = (a, b) => {
     const ba = bounds.get(a), bb = bounds.get(b);
     return !(ba.x2 + PAD < bb.x1 || bb.x2 + PAD < ba.x1 || ba.y2 + PAD < bb.y1 || bb.y2 + PAD < ba.y1);
   };
+  const overlapsOrTouches = (a, b) => mightBeClose(a, b) && polygonsCloseOrOverlapping(a, b, PAD);
   const clusterOf = new Map(); // zone -> array (its full cluster, itself included)
   const visited = new Set();
   zones.forEach(z => {
@@ -1574,14 +1711,18 @@ function renderTurnOrder() {
     return `<li class="${i === combat.currentIndex ? 'active' : ''}"><span class="turn-dot" style="background:${dotColor}"></span><div class="turn-entry"><div class="turn-entry-name">${label}</div>${moveLine}</div></li>`;
   }).join('');
 
-  const myTurn = myRole === 'dm' || (myRole === 'player' && entry?.pinIds.includes(myPinId));
+  // entry.pinIds holds TOKEN ids on THIS map — a player's identity is their characterId, so
+  // resolve to this map's token for that character (if they have one placed here at all)
+  // before checking whether it's in the active entry, same pattern as the server's endTurn.
+  const myToken = myRole === 'player' ? pins.find(p => p.type === 'player' && p.characterId === myCharacterId) : null;
+  const myTurn = myRole === 'dm' || (myRole === 'player' && !!myToken && entry?.pinIds.includes(myToken.id));
   btnEndTurn.classList.toggle('hidden', !myTurn);
 
   // A player's own visible cue that it's their turn — DM already sees/controls the whole order
   // directly, so this is player-only. Pulses the panel for as long as it's their turn, plus a
   // one-shot toast on the moment it BECOMES their turn (not re-fired on every render while it
   // stays their turn, and also fires on reconnecting mid-their-own-turn, which is useful too).
-  const isMyPlayerTurn = myRole === 'player' && !!entry?.pinIds.includes(myPinId);
+  const isMyPlayerTurn = myRole === 'player' && !!myToken && !!entry?.pinIds.includes(myToken.id);
   turnOrderPanel.classList.toggle('my-turn', isMyPlayerTurn);
   if (isMyPlayerTurn && !wasMyTurn) showToast("It's your turn!");
   wasMyTurn = isMyPlayerTurn;
@@ -1724,7 +1865,10 @@ dpClose.addEventListener('click', hideDistancePanel);
 dpLink.addEventListener('click', async () => {
   const pin = pins.find(p => p.id === currentPanelPinId);
   if (!pin) return;
-  const url = `${location.origin}/play/${pin.id}`;
+  // The link follows the CHARACTER (stable across every map it's placed on), not this map's
+  // token — a monster pin has no character behind it at all, so there's no link to give.
+  if (!pin.characterId) { showToast('Monsters don’t have a player link.'); return; }
+  const url = `${location.origin}/play/${pin.characterId}`;
   try {
     await navigator.clipboard.writeText(url);
     showToast(`Player link for ${pin.name} copied.`);
@@ -1736,7 +1880,7 @@ dpEdit.addEventListener('click', async () => {
   const pin = pins.find(p => p.id === currentPanelPinId);
   if (!pin) return;
   hideDistancePanel();
-  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, color: pin.color ?? null, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null, conditions: pin.conditions ?? [], attackRange: pin.attackRange ?? null, attackLongRange: pin.attackLongRange ?? null, icon: pin.icon ?? '' });
+  const result = await askPinDetails({ title: 'Edit pin', name: pin.name, type: pin.type, color: pin.color ?? null, size: pin.size ?? DEFAULT_SIZE, speed: pin.speed ?? DEFAULT_SPEED, hpCurrent: pin.hpCurrent ?? null, hpMax: pin.hpMax ?? null, conditions: pin.conditions ?? [], attackRange: pin.attackRange ?? null, attackLongRange: pin.attackLongRange ?? null, icon: pin.icon ?? '', locked: true });
   if (!result) return;
   pin.name = result.name;
   pin.type = result.type;
@@ -1785,6 +1929,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     hideDistancePanel();
     if (!confirmDialog.classList.contains('hidden')) closeConfirm(false);
+    if (!rosterDialog.classList.contains('hidden')) closeRosterDialog(null);
     cancelZoneDraw();
   }
 });
@@ -1793,6 +1938,7 @@ function applyWorldTransform() { world.style.transform = `translate(${panX}px, $
 
 function setMode(next) {
   mode = next;
+  if (mode !== 'add-player') pendingPlaceCharacterId = null; // abandon a pending roster placement, same spirit as cancelZoneDraw() below
   stage.className = 'mode-' + mode;
   [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnZoneSolid, btnZoneDifficult, btnZoneWater, btnDoors, btnAoeCone, btnAoeCircle, btnAoeLine].forEach(b => b.classList.remove('active'));
   if (mode === 'set-scale') btnSetScale.classList.add('active');
@@ -1815,7 +1961,9 @@ function setMode(next) {
     'no-map': myRole === 'player' ? 'Waiting for the DM to set up the map…' : 'Import a PDF battle map to begin.',
     'set-scale': 'Click two points on the map that you know the real-world distance between (e.g. opposite corners of a room), then enter that distance.',
     'pan': `Drag to pan, scroll to zoom. Drag ${mine} pin to move it, click a pin to see distances and its movement range.`,
-    'add-player': 'Click on the map to place a player pin.',
+    'add-player': pendingPlaceCharacterId
+      ? `Click on the map to place ${state.characters?.[pendingPlaceCharacterId]?.name || 'that character'}.`
+      : 'Click on the map to place a player pin.',
     'add-monster': 'Click on the map to place a monster pin.',
     'measure': 'Click a start point, then an end point, to measure the distance.',
     'zone-solid': 'Drag for a quick rectangle, or click to place a polygon\'s corners one at a time (click back near the start to close it). Click an existing zone to remove it. Only you can see these for now.',
@@ -1856,6 +2004,7 @@ function updateToolbarState() {
   btnAoeLine.disabled = !hasScale;
   btnResetView.disabled = !hasScale;
   btnDeleteMap.disabled = !hasMap;
+  btnExportMap.disabled = !hasMap;
   btnInitiative.disabled = !hasScale;
 }
 
@@ -1925,7 +2074,7 @@ async function loadActiveMap() {
 // ── pins ────────────────────────────────────────────────────────────
 function renderPin(pin) {
   const draggable = canDragNow(pin); // DM can drag anything; a player only their own, and only on their turn once combat starts
-  const highlight = myRole === 'player' && myPinId === pin.id; // ring to help a player spot their own token
+  const highlight = myRole === 'player' && myCharacterId === pin.characterId; // ring to help a player spot their own token
   // Shared party vision can reveal a monster's existence (someone in the party has LOS to it)
   // without THIS player's own pin having a clear line to it — losFromMe is only ever present
   // (server-computed, per viewer) on a player's own copy of a monster pin, never the DM's.
@@ -1962,7 +2111,12 @@ function renderPin(pin) {
   const removeEl = el.querySelector('.pin-remove');
   if (removeEl) removeEl.addEventListener('click', async (e) => {
     e.stopPropagation();
-    const ok = await askConfirm(`Remove ${pin.name}?`);
+    // For a player, this only removes their token from THIS map — the character itself (name,
+    // HP, conditions, icon) stays in the roster, ready to place again here or elsewhere.
+    const confirmMsg = pin.type === 'player'
+      ? `Remove ${pin.name} from this map? (Their character stays in the roster — you can place them again later.)`
+      : `Remove ${pin.name}?`;
+    const ok = await askConfirm(confirmMsg);
     if (!ok) return;
     pins = pins.filter(p => p.id !== pin.id);
     el.remove();
@@ -2538,7 +2692,22 @@ async function handleStageClick(e) {
   const worldX = ((e.clientX - rect.left) - panX) / zoom;
   const worldY = ((e.clientY - rect.top) - panY) / zoom;
 
-  if (mode === 'add-player' || mode === 'add-monster') {
+  if (mode === 'add-player' && pendingPlaceCharacterId) {
+    if (myRole !== 'dm') return;
+    const characterId = pendingPlaceCharacterId;
+    const character = state.characters?.[characterId];
+    pendingPlaceCharacterId = null;
+    setMode('pan'); // one-shot: placing a specific already-chosen character isn't a rapid-fire loop like creating fresh pins is
+    if (!character) { showToast('That character no longer exists.'); return; }
+    // Mirrors the server's resolvePin merge order (character fields as the base, token's own
+    // id/type/characterId/wx/wy win) so the optimistic local render matches what the
+    // authoritative broadcast will look like.
+    const token = { ...character, id: crypto.randomUUID(), type: 'player', characterId, wx: worldX, wy: worldY };
+    pins.push(token);
+    renderPin(token);
+    sendAction({ type: 'placeCharacter', mapId: state.activeMapId, characterId, wx: worldX, wy: worldY });
+    showToast(`${character.name} placed on this map.`);
+  } else if (mode === 'add-player' || mode === 'add-monster') {
     if (myRole !== 'dm') return;
     const type = mode === 'add-player' ? 'player' : 'monster';
     const result = await askPinDetails({ title: `New ${type}`, type });
@@ -2611,6 +2780,38 @@ fileInput.addEventListener('change', async () => {
   fileInput.value = '';
 });
 
+btnExportMap.addEventListener('click', () => {
+  const m = activeMap();
+  if (!m) return;
+  // A plain navigation, not fetch+blob: the response is a real file download (Content-
+  // Disposition: attachment), and the browser already has this origin's basic-auth
+  // credentials cached from loading the page, same as the existing /uploads/*.pdf links.
+  window.location.href = `/api/maps/${m.id}/export`;
+});
+
+btnImportMap.addEventListener('click', () => mapImportFileInput.click());
+mapImportFileInput.addEventListener('change', async () => {
+  const file = mapImportFileInput.files[0];
+  mapImportFileInput.value = '';
+  if (!file) return;
+  statusEl.textContent = 'Importing map…';
+  try {
+    // Sent as raw text, not re-parsed-and-restringified — an exported file can be well over
+    // 100MB once its PDF is base64-embedded, and JSON.parse/stringify would double that in
+    // memory for no benefit, since the server does the real structural validation anyway.
+    const text = await file.text();
+    const res = await fetch('/api/maps/import', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: text });
+    let data = {};
+    try { data = await res.json(); } catch {} // a malformed-JSON request never reaches our handler at all — Express's own error page isn't JSON
+    if (!res.ok) throw new Error(data.error || 'Import failed.');
+    // Same as the PDF-upload import above — rely on the websocket broadcast, not this
+    // response, to actually load the new map.
+  } catch (err) {
+    showToast(err.message || "Import failed — is that a valid exported map file?");
+    setMode(mode); // restore the hint text that "Importing map…" overwrote
+  }
+});
+
 btnDeleteMap.addEventListener('click', async () => {
   const m = activeMap();
   if (!m) return;
@@ -2628,7 +2829,14 @@ btnDeleteMap.addEventListener('click', async () => {
 
 btnSetScale.addEventListener('click', () => setMode('set-scale'));
 btnPan.addEventListener('click', () => setMode('pan'));
-btnAddPlayer.addEventListener('click', () => setMode('add-player'));
+btnAddPlayer.addEventListener('click', async () => {
+  const hasRoster = Object.keys(state.characters || {}).length > 0;
+  if (!hasRoster) { setMode('add-player'); return; } // nothing to place yet — straight to the ordinary create flow
+  const choice = await askCharacterPlacement();
+  if (!choice) return; // cancelled
+  if (choice !== '__new__') pendingPlaceCharacterId = choice;
+  setMode('add-player');
+});
 btnAddMonster.addEventListener('click', () => setMode('add-monster'));
 btnMeasure.addEventListener('click', () => setMode('measure'));
 btnZoneSolid.addEventListener('click', () => setMode('zone-solid'));

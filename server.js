@@ -18,11 +18,14 @@ fs.mkdirSync(uploadsDir, { recursive: true });
 const defaultState = {
   activeMapId: null,
   maps: {}, // id -> { id, name, file, scale, pins }
+  // A player character's identity/stats, independent of any one map — see the migration
+  // loop below and resolvedPins() for how a map's player-type pins reference this.
+  characters: {}, // id -> { id, name, color, size, speed, hpMax, hpCurrent, conditions, icon, attackRange, attackLongRange }
 };
 
 function loadState() {
   try { return { ...defaultState, ...JSON.parse(fs.readFileSync(statePath, 'utf8')) }; }
-  catch { return { ...defaultState, maps: {} }; }
+  catch { return { ...defaultState, maps: {}, characters: {} }; }
 }
 
 function saveState() {
@@ -63,6 +66,48 @@ for (const map of Object.values(state.maps)) {
     }));
     delete map.obstacles;
   }
+  // A player pin used to carry its own name/hp/conditions/icon/etc, scoped to this one map —
+  // switching maps meant recreating that player from scratch, losing all of it. Split into a
+  // campaign-level character record (this map's-worth-of-migration below writes it into
+  // state.characters, done once per pin) plus a lightweight per-map token that just marks
+  // where that character is on THIS map: { id, type:'player', characterId, wx, wy }.
+  //
+  // Both the character AND the token keep the pin's ORIGINAL id (deliberately the same value
+  // in both places, even though they're otherwise unrelated ids in two different collections)
+  // rather than minting a fresh one for either: an already-shared /play/<id> link resolves via
+  // the character id, while this map's initiative.order[].pinIds / initiative.traveled — which
+  // reference the TOKEN id — were saved before this migration ever ran and can't be rewritten
+  // retroactively, so the token has to keep answering to that same id or every in-progress
+  // turn order on this map silently orphans itself (found by testing this exact migration on a
+  // disposable copy of the real campaign data before ever running it for real).
+  //
+  // Idempotent: a pin with `characterId` already set has already been migrated (or was created
+  // fresh under this system to begin with), so it's left alone.
+  map.pins = map.pins.map(p => {
+    if (p.type !== 'player' || p.characterId) return p;
+    const characterId = p.id;
+    if (!state.characters[characterId]) {
+      state.characters[characterId] = {
+        id: characterId, name: p.name, color: p.color, size: p.size, speed: p.speed,
+        hpMax: p.hpMax, hpCurrent: p.hpCurrent, conditions: p.conditions || [],
+        icon: p.icon || '', attackRange: p.attackRange, attackLongRange: p.attackLongRange,
+      };
+    }
+    return { id: p.id, type: 'player', characterId, wx: p.wx, wy: p.wy };
+  });
+}
+
+// Overlays a player token's character record on top of the token itself — token fields (id,
+// type, characterId, wx, wy) win over any same-named character field, so the result reads
+// exactly like the old self-contained pin (name, hpCurrent, icon, ... plus wx/wy) with one
+// addition (characterId). Monster pins pass through unchanged; they were never split out.
+function resolvePin(p) {
+  if (p.type !== 'player') return p;
+  const character = state.characters[p.characterId];
+  return character ? { ...character, ...p } : p;
+}
+function resolvedPins(map) {
+  return map.pins.map(resolvePin);
 }
 
 function activeEntry(map) {
@@ -83,7 +128,7 @@ function resetTraveled(map, entry) {
 // expensive operation is the map upload (up to 100MB), so that's the one that most needs
 // gating, along with the DM page itself and the raw state dump.
 //
-// Player links (/play/:pinId) stay open on purpose — sharing the link *is* the access
+// Player links (/play/:characterId) stay open on purpose — sharing the link *is* the access
 // control there, same as it's always been; requiring the DM's password too would break the
 // whole point of a just-send-a-link flow.
 const APP_USERNAME = process.env.APP_USERNAME || 'dm';
@@ -122,11 +167,13 @@ const upload = multer({
 });
 
 const app = express();
-app.use(express.json());
+// No global express.json() — the only JSON-body route (map import, below) needs a much
+// higher size limit than the sane-default one Express would otherwise apply, and every other
+// route either takes no body or is multer's multipart form (which parses its own req.body).
 app.get('/', requireBasicAuth, (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
-app.get('/play/:pinId', (_req, res) => {
+app.get('/play/:characterId', (_req, res) => {
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 // No express.static(public) here on purpose — the only file in public/ is index.html, and
@@ -167,6 +214,112 @@ app.post('/api/maps', requireBasicAuth, (req, res) => {
     broadcastState();
     res.json(state);
   });
+});
+
+// A single self-contained JSON file: the map's own data (pins/zones/doors/templates/
+// initiative), every character referenced by one of its player pins (so re-importing it
+// doesn't leave player tokens pointing at characters that don't exist), and the background
+// PDF itself as base64 — so importing this file recreates the map in full even on a server
+// that's never seen it before, no separate PDF upload required.
+app.get('/api/maps/:id/export', requireBasicAuth, (req, res) => {
+  const map = state.maps[req.params.id];
+  if (!map) return res.status(404).json({ error: 'Map not found.' });
+  let pdfBase64;
+  try {
+    pdfBase64 = fs.readFileSync(path.join(uploadsDir, map.file)).toString('base64');
+  } catch {
+    return res.status(500).json({ error: "This map's PDF file is missing on disk — can't export it." });
+  }
+  const characterIds = new Set(map.pins.filter(p => p.type === 'player').map(p => p.characterId));
+  const characters = {};
+  for (const id of characterIds) if (state.characters[id]) characters[id] = state.characters[id];
+  const exportBody = {
+    kind: 'dndbattlemap-map-export',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    map: {
+      name: map.name, scale: map.scale, pins: map.pins, zones: map.zones,
+      doors: map.doors, templates: map.templates, initiative: map.initiative,
+    },
+    characters,
+    pdf: { dataBase64: pdfBase64 },
+  };
+  const filename = (map.name || 'map').replace(/[^a-z0-9-_ ]/gi, '').trim().slice(0, 60) || 'map';
+  res.set('Content-Disposition', `attachment; filename="${filename}.dndbattlemap.json"`);
+  res.json(exportBody);
+});
+
+// Always creates a brand-new map (never overwrites an existing one, same as uploading a fresh
+// PDF does) with fresh ids throughout — pins, zones, doors, templates, and every referenced
+// character all get new ids, remapped consistently so cross-references (a pin's characterId,
+// an initiative entry's pinIds, traveled's keys) stay correct. Never reuses the ids from the
+// export file itself: importing the same file twice, or into a campaign that already has a
+// character with a colliding id, must never silently merge with or overwrite something that
+// already exists — every import is a fully independent copy the DM can then manage normally
+// (rename, delete, edit) like any other map/character.
+app.post('/api/maps/import', requireBasicAuth, express.json({ limit: '150mb' }), (req, res) => {
+  const body = req.body;
+  if (!body || body.kind !== 'dndbattlemap-map-export' || !body.map || !body.pdf?.dataBase64) {
+    return res.status(400).json({ error: "That doesn't look like an exported map file." });
+  }
+  let pdfBuffer;
+  try { pdfBuffer = Buffer.from(body.pdf.dataBase64, 'base64'); }
+  catch { return res.status(400).json({ error: 'Could not read the embedded PDF data.' }); }
+  if (!pdfBuffer.length) return res.status(400).json({ error: 'Could not read the embedded PDF data.' });
+
+  const characterIdMap = new Map(); // old id -> new id
+  const characters = {};
+  for (const [oldId, character] of Object.entries(body.characters || {})) {
+    const newId = crypto.randomUUID();
+    characterIdMap.set(oldId, newId);
+    characters[newId] = { ...character, id: newId };
+  }
+  const pinIdMap = new Map(); // old token id -> new token id
+  const pins = (body.map.pins || [])
+    .map(p => {
+      const newId = crypto.randomUUID();
+      if (p.type === 'player') {
+        const newCharacterId = characterIdMap.get(p.characterId);
+        if (!newCharacterId) return null; // export referenced a character it didn't actually include — drop the pin rather than create a broken one
+        pinIdMap.set(p.id, newId);
+        return { id: newId, type: 'player', characterId: newCharacterId, wx: p.wx, wy: p.wy };
+      }
+      pinIdMap.set(p.id, newId);
+      return { ...p, id: newId };
+    })
+    .filter(Boolean);
+  const zones = (body.map.zones || []).map(z => ({ ...z, id: crypto.randomUUID() }));
+  const doors = (body.map.doors || []).map(d => ({ ...d, id: crypto.randomUUID() }));
+  const templates = (body.map.templates || []).map(t => ({ ...t, id: crypto.randomUUID() }));
+
+  const oldInit = body.map.initiative;
+  let initiative = defaultInitiative();
+  if (oldInit) {
+    const order = (oldInit.order || [])
+      .map(entry => ({ id: crypto.randomUUID(), pinIds: (entry.pinIds || []).map(id => pinIdMap.get(id)).filter(Boolean) }))
+      .filter(entry => entry.pinIds.length > 0);
+    const traveled = {};
+    for (const [oldPinId, v] of Object.entries(oldInit.traveled || {})) {
+      const newPinId = pinIdMap.get(oldPinId);
+      if (newPinId) traveled[newPinId] = v;
+    }
+    initiative = order.length
+      ? { order, active: !!oldInit.active, currentIndex: Math.min(oldInit.currentIndex || 0, order.length - 1), round: oldInit.round || 1, traveled }
+      : defaultInitiative();
+  }
+
+  const mapId = crypto.randomUUID();
+  fs.writeFileSync(path.join(uploadsDir, `${mapId}.pdf`), pdfBuffer);
+  const name = (body.map.name ? `${body.map.name} (imported)` : 'Imported map').toString().trim().slice(0, 80) || 'Imported map';
+  Object.assign(state.characters, characters);
+  state.maps[mapId] = {
+    id: mapId, name, file: `${mapId}.pdf`, scale: body.map.scale ?? null,
+    pins, zones, doors, templates, initiative,
+  };
+  state.activeMapId = mapId;
+  saveState();
+  broadcastState();
+  res.json(state);
 });
 
 app.delete('/api/maps/:id', requireBasicAuth, (req, res) => {
@@ -332,13 +485,21 @@ function traceCostAlongPath(fromX, fromY, toX, toY, zones, budget) {
 // 'hello' handler below). This split is what lets stateForConnection() below filter what's
 // broadcast to whom without any further data-model changes: pins already carry a `hidden`
 // flag (unused today, always false) for a future fog-of-war feature to use the same way.
-const clients = new Set(); // { ws, role: 'dm'|'player'|null, pinId: string|null, authenticatedDm: boolean }
+const clients = new Set(); // { ws, role: 'dm'|'player'|null, characterId: string|null, authenticatedDm: boolean }
 
 function stateForConnection(conn) {
-  // Explicit allow-list for the one privileged case, rather than a deny-list on 'player' —
-  // an unauthenticated connection (role null) must fall through to the filtered branch below
-  // exactly like a player does, not get the unfiltered state by default.
-  if (conn.role === 'dm') return state;
+  // Both branches send fully-resolved pins (character fields overlaid onto player tokens) —
+  // the client reads pin.name/hpCurrent/icon/etc exactly like before the character/token
+  // split, and only needs to know about pin.characterId for the handful of places that
+  // specifically care (the player link, and offering "place an existing character").
+  if (conn.role === 'dm') {
+    const maps = {};
+    for (const [id, map] of Object.entries(state.maps)) maps[id] = { ...map, pins: resolvedPins(map) };
+    return { ...state, maps };
+  }
+  // Explicit allow-list for the one privileged case above, rather than a deny-list on
+  // 'player' — an unauthenticated connection (role null) must fall through to this filtered
+  // branch exactly like a player does, not get the unfiltered state by default.
   const maps = {};
   for (const [id, map] of Object.entries(state.maps)) {
     // Zone geometry itself isn't secret — a wall (or a patch of mud) is right there on the
@@ -356,9 +517,12 @@ function stateForConnection(conn) {
     // monster's existence without this player being able to target it themselves (e.g. a
     // teammate down the hall spots it around a corner this player can't see past), and that
     // distinction has to be visible in the UI for targeting decisions.
-    const playerPins = map.pins.filter(p => p.type === 'player');
-    const myPin = map.pins.find(p => p.id === conn.pinId);
-    const pins = map.pins
+    const resolved = resolvedPins(map);
+    const playerPins = resolved.filter(p => p.type === 'player');
+    // Matched by characterId, not token id — a player's identity now follows their character
+    // across maps, so "my pin on this map" is whichever token here (if any) is theirs.
+    const myPin = resolved.find(p => p.type === 'player' && p.characterId === conn.characterId);
+    const pins = resolved
       .filter(p => p.type !== 'monster' || playerPins.some(pp => hasLOS(pp, p, map.zones, map.doors)))
       .map(p => p.type !== 'monster' ? p : { ...p, losFromMe: !!myPin && hasLOS(myPin, p, map.zones, map.doors) });
     maps[id] = { ...map, pins };
@@ -385,6 +549,9 @@ function broadcastState() {
   }
 }
 
+// Returns the RAW token (not resolvePin'd) — callers that write to a pin need to know whether
+// it's a character-backed player token or a self-contained monster pin; callers that only need
+// to read full stats (e.g. movePin's speed check below) resolve explicitly via state.characters.
 function findPin(mapId, pinId) {
   const map = state.maps[mapId];
   const pin = map?.pins.find(p => p.id === pinId);
@@ -402,10 +569,10 @@ function handleMessage(conn, msg) {
       // assuming "not player" meant "must be dm").
       if (msg.role === 'player') {
         conn.role = 'player';
-        conn.pinId = msg.pinId;
+        conn.characterId = msg.characterId;
       } else {
         conn.role = conn.authenticatedDm ? 'dm' : null;
-        conn.pinId = null;
+        conn.characterId = null;
       }
       send(conn, { type: 'state', state: stateForConnection(conn) });
       return;
@@ -414,10 +581,36 @@ function handleMessage(conn, msg) {
       if (conn.role !== 'dm') return;
       const map = state.maps[msg.mapId];
       if (!map || !msg.pin) return;
-      map.pins.push(msg.pin);
+      if (msg.pin.type === 'player') {
+        // A brand-new character: split the client's single pin object into a roster entry
+        // (everything but position) plus a token on this map (just position, pointing at it)
+        // — see the migration loop up top for the same split applied to old data.
+        const characterId = crypto.randomUUID();
+        const { id, type, wx, wy, ...stats } = msg.pin;
+        state.characters[characterId] = { id: characterId, ...stats };
+        map.pins.push({ id: crypto.randomUUID(), type: 'player', characterId, wx, wy });
+      } else {
+        map.pins.push(msg.pin);
+      }
+      break;
+    }
+    // Places an EXISTING roster character onto a map as a new token — the payoff of the
+    // character/token split: reusing a character elsewhere is just a new lightweight token
+    // pointing at the same characterId, not a full recreation, so HP/conditions/icon carry
+    // over automatically (they live on the character, not the token).
+    case 'placeCharacter': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      const character = state.characters[msg.characterId];
+      if (!map || !character) return;
+      map.pins.push({ id: crypto.randomUUID(), type: 'player', characterId: msg.characterId, wx: msg.wx, wy: msg.wy });
       break;
     }
     case 'removePin': {
+      // Removes this map's TOKEN (placement) only — a player character's roster record in
+      // state.characters is untouched, so it's still there to re-place on this or another map
+      // later. There's deliberately no "delete a character from the roster entirely" action
+      // yet; an unplaced character just sits unused, which is harmless.
       if (conn.role !== 'dm') return;
       const map = state.maps[msg.mapId];
       if (!map) return;
@@ -457,7 +650,9 @@ function handleMessage(conn, msg) {
       const isActiveTurn = !!entry && entry.pinIds.includes(msg.pinId);
 
       if (conn.role === 'player') {
-        if (conn.pinId !== msg.pinId) return; // only ever your own pin
+        // Matched by characterId, not token id, so "your own pin" follows you across maps —
+        // same identity check as stateForConnection's myPin lookup.
+        if (pin.type !== 'player' || pin.characterId !== conn.characterId) return;
         if (map.initiative?.active && !isActiveTurn) return; // and only on your own turn once combat has started
       }
 
@@ -468,8 +663,12 @@ function handleMessage(conn, msg) {
       // repositioning a pin for story/staging reasons.
       if (conn.role !== 'dm' && movementBlockedBy(pin.wx, pin.wy, msg.wx, msg.wy, map.zones, map.doors)) return;
 
+      // pin is the raw token, which no longer carries `speed` itself for a player (that's on
+      // the character record now) — resolve it here rather than switching this whole function
+      // to the merged view, since everything else below only ever needs wx/wy/id.
+      const speed = pin.type === 'player' ? state.characters[pin.characterId]?.speed : pin.speed;
       let wx = msg.wx, wy = msg.wy;
-      if (conn.role === 'player' && isActiveTurn && pin.speed && map.scale) {
+      if (conn.role === 'player' && isActiveTurn && speed && map.scale) {
         // Clamp against the REMAINING budget (total speed minus what's already been spent
         // this turn), anchored to the pin's current position — not a fresh speed's worth
         // measured from wherever the turn began — so a move → action → move again sequence
@@ -479,7 +678,7 @@ function handleMessage(conn, msg) {
         // computed exactly by traceCostAlongPath rather than a flat ratio — a drag that starts
         // in normal terrain and crosses into a costly zone partway through correctly spends
         // less total distance than an equally-long drag entirely in the open.
-        const maxTotal = pin.speed * map.scale;
+        const maxTotal = speed * map.scale;
         const traveled = map.initiative.traveled[pin.id] || 0;
         const remaining = Math.max(0, maxTotal - traveled);
         const result = traceCostAlongPath(pin.wx, pin.wy, wx, wy, map.zones, remaining);
@@ -500,10 +699,21 @@ function handleMessage(conn, msg) {
       if (conn.role === 'player') {
         // players may only touch their own pin, and only its current HP, conditions, or class
         // icon — name/type/colour/size/speed stay DM-only
-        if (conn.pinId !== msg.pinId) return;
+        if (pin.type !== 'player' || pin.characterId !== conn.characterId) return;
         if (!keys.every(k => k === 'hpCurrent' || k === 'conditions' || k === 'icon')) return;
       }
-      Object.assign(pin, msg.patch);
+      // `type` is set once at creation (it decides whether a pin even has a characterId) and
+      // never editable afterward — converting a token between character-backed and
+      // self-contained monster shape mid-flight isn't supported, so silently drop any attempt
+      // rather than risk a player-type pin with no character record (or vice versa).
+      const { type, ...patch } = msg.patch;
+      if (pin.type === 'player') {
+        const character = state.characters[pin.characterId];
+        if (!character) return;
+        Object.assign(character, patch);
+      } else {
+        Object.assign(pin, patch);
+      }
       break;
     }
     case 'setScale': {
@@ -643,7 +853,11 @@ function handleMessage(conn, msg) {
       const map = state.maps[msg.mapId];
       if (!map || !map.initiative?.active) return;
       const entry = map.initiative.order[map.initiative.currentIndex];
-      const isMyTurn = entry && conn.role === 'player' && entry.pinIds.includes(conn.pinId);
+      // entry.pinIds holds TOKEN ids (this map's placements), but a player's identity is now
+      // their characterId — resolve to this map's token for that character, if they have one,
+      // same as movePin/stateForConnection's myPin lookup.
+      const myToken = map.pins.find(p => p.type === 'player' && p.characterId === conn.characterId);
+      const isMyTurn = entry && conn.role === 'player' && !!myToken && entry.pinIds.includes(myToken.id);
       if (conn.role !== 'dm' && !isMyTurn) return;
 
       const order = map.initiative.order;
@@ -684,10 +898,10 @@ wss.on('connection', (ws, req) => {
   // already has basic-auth credentials cached for this origin (from loading the DM page at
   // '/', which requires them) automatically resends the same Authorization header here too —
   // no separate password prompt needed. A player's browser, having only ever loaded the
-  // unprotected /play/:pinId route, never has credentials cached and so never sends this
-  // header; that's fine, since claiming 'player' in 'hello' never required it anyway.
+  // unprotected /play/:characterId route, never has credentials cached and so never sends
+  // this header; that's fine, since claiming 'player' in 'hello' never required it anyway.
   const authenticatedDm = checkBasicAuth(req);
-  const conn = { ws, role: null, pinId: null, authenticatedDm };
+  const conn = { ws, role: null, characterId: null, authenticatedDm };
   clients.add(conn);
   ws.on('message', (raw) => {
     let msg;
