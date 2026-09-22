@@ -157,7 +157,7 @@ app.post('/api/maps', requireBasicAuth, (req, res) => {
       file: `${id}.pdf`,
       scale: null, // pixels-per-foot, set by clicking two points a known distance apart
       pins: [], // { id, type: 'player'|'monster', name, color, icon, speed, attackRange, attackLongRange, hpMax, hpCurrent, conditions, hidden, wx, wy }
-      zones: [], // { id, kind: 'solid'|'difficult', points: [{x,y},...] } — see ZONE_KINDS; geometry visible to everyone, whether the DM's marker/authoring box is player-visible depends on kind (see stateForConnection and ZONE_KINDS.visibleToPlayers client-side)
+      zones: [], // { id, kind: 'solid'|'difficult'|'water', points: [{x,y},...] } — see ZONE_KINDS; geometry visible to everyone, whether the DM's marker/authoring box is player-visible depends on kind (see stateForConnection and ZONE_KINDS.visibleToPlayers client-side)
       templates: [], // { id, shape: 'cone'|'circle'|'line', x, y, angle, length, radius, width } — visible to everyone
       doors: [], // { id, x1, y1, x2, y2, open } — blocks LOS/movement like an obstacle edge while closed; DM-only to place/remove/toggle, geometry and open/closed state visible to everyone (same reasoning as obstacles — a door is not secret, only the authoring controls are)
       initiative: defaultInitiative(),
@@ -194,6 +194,9 @@ app.delete('/api/maps/:id', requireBasicAuth, (req, res) => {
 const ZONE_KINDS = {
   solid:     { blocksLOS: true,  blocksMovement: true,  costMultiplier: 1 },
   difficult: { blocksLOS: false, blocksMovement: false, costMultiplier: 2 },
+  // Water doesn't block sight or movement either (swimming without a swim speed costs extra
+  // like difficult terrain, per 5e, but that's the same not-yet-enforced costMultiplier story).
+  water:     { blocksLOS: false, blocksMovement: false, costMultiplier: 2 },
 };
 
 // ── line of sight ─────────────────────────────────────────────────────

@@ -18,6 +18,7 @@
     --measure: #f5a623;
     --zone-solid: #a78bfa;
     --zone-difficult: #d9a441;
+    --zone-water: #38a4dc;
     --template: #38bdf8;
     --attack: #fb7185;
     --door: #c08a3e;
@@ -75,6 +76,7 @@
   body.player-mode #btnInitiative,
   body.player-mode #btnZoneSolid,
   body.player-mode #btnZoneDifficult,
+  body.player-mode #btnZoneWater,
   body.player-mode #btnDoors,
   body.player-mode #btnAoeCone,
   body.player-mode #btnAoeCircle,
@@ -192,6 +194,7 @@
   .zone-shape { fill-opacity: .22; stroke-width: 1.5; stroke-dasharray: 4 3; pointer-events: auto; cursor: pointer; }
   .zone-shape.kind-solid { fill: var(--zone-solid); stroke: var(--zone-solid); }
   .zone-shape.kind-difficult { fill: var(--zone-difficult); stroke: var(--zone-difficult); }
+  .zone-shape.kind-water { fill: var(--zone-water); stroke: var(--zone-water); }
   .zone-remove { opacity: 0; cursor: pointer; transition: opacity .1s; pointer-events: none; }
   .zone-group:hover .zone-remove { opacity: 1; pointer-events: auto; }
   .zone-remove circle { fill: #20222c; stroke: var(--border); }
@@ -442,6 +445,7 @@
   <button id="btnMeasure" disabled>Measure</button>
   <button id="btnZoneSolid" disabled>Solid areas</button>
   <button id="btnZoneDifficult" disabled>Difficult terrain</button>
+  <button id="btnZoneWater" disabled>Water</button>
   <button id="btnDoors" disabled>Doors</button>
   <button id="btnAoeCone" disabled>Cone</button>
   <button id="btnAoeCircle" disabled>Circle</button>
@@ -648,6 +652,7 @@ const btnAddMonster=document.getElementById('btnAddMonster');
 const btnMeasure  = document.getElementById('btnMeasure');
 const btnZoneSolid = document.getElementById('btnZoneSolid');
 const btnZoneDifficult = document.getElementById('btnZoneDifficult');
+const btnZoneWater = document.getElementById('btnZoneWater');
 const btnDoors    = document.getElementById('btnDoors');
 const btnAoeCone  = document.getElementById('btnAoeCone');
 const btnAoeCircle= document.getElementById('btnAoeCircle');
@@ -833,8 +838,9 @@ function clampToSpeed(pin, wx, wy, anchor) {
 // is a visible marker for now, not auto-applied movement math — a deliberate first-pass
 // scoping) but is recorded so the data model doesn't need to change again for it.
 const ZONE_KINDS = {
-  solid:     { label: 'Solid area',      blocksLOS: true,  blocksMovement: true,  costMultiplier: 1, visibleToPlayers: false },
+  solid:     { label: 'Solid area',        blocksLOS: true,  blocksMovement: true,  costMultiplier: 1, visibleToPlayers: false },
   difficult: { label: 'Difficult terrain', blocksLOS: false, blocksMovement: false, costMultiplier: 2, visibleToPlayers: true  },
+  water:     { label: 'Water',             blocksLOS: false, blocksMovement: false, costMultiplier: 2, visibleToPlayers: true  },
 };
 // Mirrors the server's zone-blocking check for the same jank-free-drag reason as
 // clampToSpeed above. Every connection receives real zone geometry (see stateForConnection in
@@ -1657,7 +1663,7 @@ function applyWorldTransform() { world.style.transform = `translate(${panX}px, $
 function setMode(next) {
   mode = next;
   stage.className = 'mode-' + mode;
-  [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnZoneSolid, btnZoneDifficult, btnDoors, btnAoeCone, btnAoeCircle, btnAoeLine].forEach(b => b.classList.remove('active'));
+  [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnZoneSolid, btnZoneDifficult, btnZoneWater, btnDoors, btnAoeCone, btnAoeCircle, btnAoeLine].forEach(b => b.classList.remove('active'));
   if (mode === 'set-scale') btnSetScale.classList.add('active');
   if (mode === 'pan') btnPan.classList.add('active');
   if (mode === 'add-player') btnAddPlayer.classList.add('active');
@@ -1665,6 +1671,7 @@ function setMode(next) {
   if (mode === 'measure') btnMeasure.classList.add('active');
   if (mode === 'zone-solid') btnZoneSolid.classList.add('active');
   if (mode === 'zone-difficult') btnZoneDifficult.classList.add('active');
+  if (mode === 'zone-water') btnZoneWater.classList.add('active');
   if (mode === 'doors') btnDoors.classList.add('active');
   if (mode === 'aoe-cone') btnAoeCone.classList.add('active');
   if (mode === 'aoe-circle') btnAoeCircle.classList.add('active');
@@ -1682,6 +1689,7 @@ function setMode(next) {
     'measure': 'Click a start point, then an end point, to measure the distance.',
     'zone-solid': 'Drag for a quick rectangle, or click to place a polygon\'s corners one at a time (click back near the start to close it). Click an existing zone to remove it. Only you can see these for now.',
     'zone-difficult': 'Drag for a quick rectangle, or click to place a polygon\'s corners one at a time (click back near the start to close it). Click an existing zone to remove it. Visible to everyone.',
+    'zone-water': 'Drag for a quick rectangle, or click to place a polygon\'s corners one at a time (click back near the start to close it). Click an existing zone to remove it. Visible to everyone.',
     'doors': 'Drag along an opening to place a door. Click an existing one to open/close it, or hover it for a × to remove it.',
     'aoe-cone': 'Drag from the origin to aim and size a cone. Click an existing one to remove it.',
     'aoe-circle': 'Drag from the center to size a circle. Click an existing one to remove it.',
@@ -1710,6 +1718,7 @@ function updateToolbarState() {
   btnMeasure.disabled = !hasScale;
   btnZoneSolid.disabled = !hasScale;
   btnZoneDifficult.disabled = !hasScale;
+  btnZoneWater.disabled = !hasScale;
   btnDoors.disabled = !hasScale;
   btnAoeCone.disabled = !hasScale;
   btnAoeCircle.disabled = !hasScale;
@@ -1941,7 +1950,7 @@ function renderZones() {
     });
   });
 }
-function currentZoneKind() { return mode === 'zone-difficult' ? 'difficult' : 'solid'; }
+function currentZoneKind() { return mode.slice(5); } // 'zone-water' -> 'water', etc.
 function drawZoneRectPreview(kind, x1, y1, x2, y2) {
   const x = Math.min(x1, x2), y = Math.min(y1, y2), w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
   zonePreview.innerHTML = `<polygon class="zone-shape kind-${kind}" points="${x},${y} ${x + w},${y} ${x + w},${y + h} ${x},${y + h}"/>`;
@@ -2196,7 +2205,7 @@ stage.addEventListener('pointerdown', (e) => {
     if (activeTouches.size > 2) return; // ignore a third finger
   }
 
-  if ((mode === 'zone-solid' || mode === 'zone-difficult') && myRole === 'dm' && !e.target.closest('.zone-shape')) {
+  if (mode.startsWith('zone-') && myRole === 'dm' && !e.target.closest('.zone-shape')) {
     const rect = stage.getBoundingClientRect();
     const worldX = ((e.clientX - rect.left) - panX) / zoom;
     const worldY = ((e.clientY - rect.top) - panY) / zoom;
@@ -2488,6 +2497,7 @@ btnAddMonster.addEventListener('click', () => setMode('add-monster'));
 btnMeasure.addEventListener('click', () => setMode('measure'));
 btnZoneSolid.addEventListener('click', () => setMode('zone-solid'));
 btnZoneDifficult.addEventListener('click', () => setMode('zone-difficult'));
+btnZoneWater.addEventListener('click', () => setMode('zone-water'));
 btnDoors.addEventListener('click', () => setMode('doors'));
 btnAoeCone.addEventListener('click', () => setMode('aoe-cone'));
 btnAoeCircle.addEventListener('click', () => setMode('aoe-circle'));
