@@ -16,7 +16,8 @@
     --player: #3ecf6a;
     --monster: #e5484d;
     --measure: #f5a623;
-    --obstacle: #a78bfa;
+    --zone-solid: #a78bfa;
+    --zone-difficult: #d9a441;
     --template: #38bdf8;
     --attack: #fb7185;
     --door: #c08a3e;
@@ -72,7 +73,8 @@
   body.player-mode #dpLink,
   body.player-mode #dpDuplicate,
   body.player-mode #btnInitiative,
-  body.player-mode #btnObstacles,
+  body.player-mode #btnZoneSolid,
+  body.player-mode #btnZoneDifficult,
   body.player-mode #btnDoors,
   body.player-mode #btnAoeCone,
   body.player-mode #btnAoeCircle,
@@ -186,36 +188,20 @@
   }
   .pin:hover .pin-remove { display: block; }
 
-  #obstaclesLayer { position: absolute; left: 0; top: 0; }
-  .obstacle-rect {
-    position: absolute;
-    background: repeating-linear-gradient(45deg, rgba(167,139,250,.28), rgba(167,139,250,.28) 6px, rgba(167,139,250,.14) 6px, rgba(167,139,250,.14) 12px);
-    border: 1.5px dashed var(--obstacle);
-    border-radius: 2px;
-  }
-  #stage.mode-obstacles .obstacle-rect { cursor: pointer; }
-  .obstacle-remove {
-    position: absolute;
-    top: -7px; right: -7px;
-    width: 17px; height: 17px;
-    border-radius: 50%;
-    background: #20222c;
-    color: #fff;
-    border: 1px solid var(--border);
-    font-size: 11px;
-    line-height: 1;
-    padding: 0;
-    display: none;
-    cursor: pointer;
-  }
-  .obstacle-rect:hover .obstacle-remove { display: block; }
-  #obstaclePreview {
-    position: absolute;
-    background: rgba(167,139,250,.18);
-    border: 1.5px dashed var(--obstacle);
-    border-radius: 2px;
-    pointer-events: none;
-  }
+  #zonesLayer, #zonePreview { position: absolute; left: 0; top: 0; overflow: visible; pointer-events: none; }
+  .zone-shape { fill-opacity: .22; stroke-width: 1.5; stroke-dasharray: 4 3; pointer-events: auto; cursor: pointer; }
+  .zone-shape.kind-solid { fill: var(--zone-solid); stroke: var(--zone-solid); }
+  .zone-shape.kind-difficult { fill: var(--zone-difficult); stroke: var(--zone-difficult); }
+  .zone-remove { opacity: 0; cursor: pointer; transition: opacity .1s; pointer-events: none; }
+  .zone-group:hover .zone-remove { opacity: 1; pointer-events: auto; }
+  .zone-remove circle { fill: #20222c; stroke: var(--border); }
+  .zone-remove text { fill: #fff; font-size: 11px; text-anchor: middle; dominant-baseline: central; pointer-events: none; }
+  /* pointer-events: none here since the preview shares .zone-shape's styling but must never
+     intercept a click meant to place the next vertex — only a committed zone should be
+     clickable, never the live preview. */
+  #zonePreview .zone-shape { stroke-width: 2; pointer-events: none; }
+  #zonePreview .zone-vertex { fill: #fff; stroke: var(--border); stroke-width: 1; }
+  #zonePreview .zone-rubber { stroke-width: 1.5; stroke-dasharray: 3 3; fill: none; }
 
   .measure-label {
     font-size: 12px;
@@ -454,7 +440,8 @@
   <button id="btnAddPlayer" disabled>+ Player</button>
   <button id="btnAddMonster" disabled>+ Monster</button>
   <button id="btnMeasure" disabled>Measure</button>
-  <button id="btnObstacles" disabled>Solid areas</button>
+  <button id="btnZoneSolid" disabled>Solid areas</button>
+  <button id="btnZoneDifficult" disabled>Difficult terrain</button>
   <button id="btnDoors" disabled>Doors</button>
   <button id="btnAoeCone" disabled>Cone</button>
   <button id="btnAoeCircle" disabled>Circle</button>
@@ -469,8 +456,8 @@
   <div id="placeholder">Import a PDF battle map to begin.</div>
   <div id="world">
     <canvas id="mapCanvas"></canvas>
-    <div id="obstaclesLayer"></div>
-    <div id="obstaclePreview" class="hidden"></div>
+    <svg id="zonesLayer"></svg>
+    <svg id="zonePreview" class="hidden"></svg>
     <div id="pinsLayer"></div>
     <svg id="fogLayer"></svg>
     <svg id="templatesLayer"></svg>
@@ -640,8 +627,8 @@ const rangeLayer  = document.getElementById('rangeLayer');
 const attackRangeLayer = document.getElementById('attackRangeLayer');
 const pinsLayer   = document.getElementById('pinsLayer');
 const measureLayer= document.getElementById('measureLayer');
-const obstaclesLayer=document.getElementById('obstaclesLayer');
-const obstaclePreview=document.getElementById('obstaclePreview');
+const zonesLayer = document.getElementById('zonesLayer');
+const zonePreview = document.getElementById('zonePreview');
 const templatesLayer = document.getElementById('templatesLayer');
 const templatePreview = document.getElementById('templatePreview');
 const doorsLayer = document.getElementById('doorsLayer');
@@ -659,7 +646,8 @@ const btnPan      = document.getElementById('btnPan');
 const btnAddPlayer= document.getElementById('btnAddPlayer');
 const btnAddMonster=document.getElementById('btnAddMonster');
 const btnMeasure  = document.getElementById('btnMeasure');
-const btnObstacles= document.getElementById('btnObstacles');
+const btnZoneSolid = document.getElementById('btnZoneSolid');
+const btnZoneDifficult = document.getElementById('btnZoneDifficult');
 const btnDoors    = document.getElementById('btnDoors');
 const btnAoeCone  = document.getElementById('btnAoeCone');
 const btnAoeCircle= document.getElementById('btnAoeCircle');
@@ -839,26 +827,35 @@ function clampToSpeed(pin, wx, wy, anchor) {
   const ratio = remaining / dist;
   return { wx: anchor.wx + dx * ratio, wy: anchor.wy + dy * ratio };
 }
-// Mirrors the server's obstacle-blocking check for the same jank-free-drag reason as
-// clampToSpeed above. Every connection receives real obstacle geometry (see
-// stateForConnection in server.js — it was never actually secret, only the DM's marker box
-// is), so this blocks locally for a player exactly as it does for the DM, not just on the
-// server's say-so after the fact.
+// A zone's kind determines its behavior — table-driven so a new kind later is one row here
+// (plus a render style below), not scattered special-casing through LOS/movement/rendering
+// code. Mirrors server.js's ZONE_KINDS; costMultiplier isn't enforced yet (difficult terrain
+// is a visible marker for now, not auto-applied movement math — a deliberate first-pass
+// scoping) but is recorded so the data model doesn't need to change again for it.
+const ZONE_KINDS = {
+  solid:     { label: 'Solid area',      blocksLOS: true,  blocksMovement: true,  costMultiplier: 1, visibleToPlayers: false },
+  difficult: { label: 'Difficult terrain', blocksLOS: false, blocksMovement: false, costMultiplier: 2, visibleToPlayers: true  },
+};
+// Mirrors the server's zone-blocking check for the same jank-free-drag reason as
+// clampToSpeed above. Every connection receives real zone geometry (see stateForConnection in
+// server.js — it was never actually secret, only whether the DM's marker itself is
+// player-visible depends on kind), so this blocks locally for a player exactly as it does for
+// the DM, not just on the server's say-so after the fact.
 function segmentsIntersect(p1, p2, p3, p4) {
   const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
   const d1 = cross(p3, p4, p1), d2 = cross(p3, p4, p2);
   const d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
   return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
-// Parameterized so fog rendering can ask "is this obstacle's own footprint visible" by
-// excluding that one obstacle from the blocker list — pathBlocked() itself always checks
-// against the full active-map list.
-function segmentBlockedBy(fromWx, fromWy, toWx, toWy, obstacles, doors) {
+// Same shape as castVisibility's LOS check but reads blocksMovement instead of blocksLOS —
+// kept separate rather than reused, since a future kind could set the two flags differently.
+function movementBlockedBy(fromWx, fromWy, toWx, toWy, zones, doors) {
   const pa = { x: fromWx, y: fromWy }, pb = { x: toWx, y: toWy };
-  for (const o of obstacles) {
-    const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
-    for (let i = 0; i < 4; i++) {
-      if (segmentsIntersect(pa, pb, c[i], c[(i + 1) % 4])) return true;
+  for (const z of zones) {
+    if (!ZONE_KINDS[z.kind]?.blocksMovement) continue;
+    const pts = z.points;
+    for (let i = 0; i < pts.length; i++) {
+      if (segmentsIntersect(pa, pb, pts[i], pts[(i + 1) % pts.length])) return true;
     }
   }
   for (const d of doors) {
@@ -869,7 +866,7 @@ function segmentBlockedBy(fromWx, fromWy, toWx, toWy, obstacles, doors) {
 }
 function pathBlocked(fromWx, fromWy, toWx, toWy) {
   const m = activeMap();
-  return segmentBlockedBy(fromWx, fromWy, toWx, toWy, m?.obstacles || [], m?.doors || []);
+  return movementBlockedBy(fromWx, fromWy, toWx, toWy, m?.zones || [], m?.doors || []);
 }
 function remainingSpeed(pin) {
   const m = activeMap();
@@ -927,7 +924,7 @@ function applyRemoteState(newState) {
     const m = activeMap();
     pins = m?.pins || [];
     renderAllPins();
-    renderObstacles();
+    renderZones();
     renderTemplates();
     renderDoors();
     renderFog();
@@ -1141,17 +1138,17 @@ function drawRange(pin) {
 }
 
 // ── attack range (shown alongside movement range for the selected pin) ─
-// A plain circle isn't right here — a solid area should block line of fire the same way it
-// blocks line of sight, so this casts a ray outward at each of `steps` evenly-spaced angles
-// and stops it at the nearest obstacle edge (or the full range, if nothing's in the way),
+// A plain circle isn't right here — a blocksLOS zone should block line of fire the same way
+// it blocks line of sight, so this casts a ray outward at each of `steps` evenly-spaced angles
+// and stops it at the nearest blocking zone edge (or the full range, if nothing's in the way),
 // then connects the resulting points into a polygon. Not a true visibility polygon (no
 // precise ray-to-corner alignment, just a dense angular sample) — a close approximation that's
 // far simpler to get right, and smooth enough at normal zoom levels with 144 sample points.
 //
-// Every connection receives real obstacle geometry now (see stateForConnection in server.js —
-// it was never actually secret, only the DM's marker box is), so this is equally accurate
-// whoever's viewing it: a player's own client can ray-cast their own pin's attack range
-// against the same walls the DM sees, not just a plain unblocked circle.
+// Every connection receives real zone geometry now (see stateForConnection in server.js — it
+// was never actually secret, only whether the DM's marker is player-visible depends on kind),
+// so this is equally accurate whoever's viewing it: a player's own client can ray-cast their
+// own pin's attack range against the same walls the DM sees, not just a plain unblocked circle.
 function rayIntersectsSegment(ox, oy, dx, dy, e1, e2) {
   const sx = e2.x - e1.x, sy = e2.y - e1.y;
   const denom = dx * sy - dy * sx;
@@ -1161,50 +1158,52 @@ function rayIntersectsSegment(ox, oy, dx, dy, e1, e2) {
   if (t >= 0 && s >= 0 && s <= 1) return t;
   return null;
 }
-// Shared core for both the polygon shape and (for fog) which obstacles actually cast part of
-// its boundary — tracking that alongside the ray-cast itself, rather than a separate check
-// afterward, means "is this obstacle part of the shadow edge" can never disagree with what the
-// shadow actually looks like, however many other obstacles are in the scene.
-function castVisibility(ox, oy, radius, obstacles, doors, steps) {
+// Shared core for both the polygon shape and (for fog) which zones actually cast part of its
+// boundary — tracking that alongside the ray-cast itself, rather than a separate check
+// afterward, means "is this zone part of the shadow edge" can never disagree with what the
+// shadow actually looks like, however many zones are in the scene. Only blocksLOS zones (kind
+// 'solid' today) participate — difficult terrain doesn't block sight, so it never appears here.
+function castVisibility(ox, oy, radius, zones, doors, steps) {
   const points = [];
-  const hitObstacles = new Set();
+  const hitZones = new Set();
   for (let i = 0; i < steps; i++) {
     const angle = (i / steps) * Math.PI * 2;
     const dx = Math.cos(angle), dy = Math.sin(angle);
     let dist = radius;
-    let hitObstacle = null;
-    for (const o of obstacles) {
-      const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
-      for (let j = 0; j < 4; j++) {
-        const t = rayIntersectsSegment(ox, oy, dx, dy, c[j], c[(j + 1) % 4]);
-        if (t !== null && t < dist) { dist = t; hitObstacle = o; }
+    let hitZone = null;
+    for (const z of zones) {
+      if (!ZONE_KINDS[z.kind]?.blocksLOS) continue;
+      const pts = z.points;
+      for (let j = 0; j < pts.length; j++) {
+        const t = rayIntersectsSegment(ox, oy, dx, dy, pts[j], pts[(j + 1) % pts.length]);
+        if (t !== null && t < dist) { dist = t; hitZone = z; }
       }
     }
     for (const d of doors) {
       if (d.open) continue;
       const t = rayIntersectsSegment(ox, oy, dx, dy, { x: d.x1, y: d.y1 }, { x: d.x2, y: d.y2 });
-      if (t !== null && t < dist) { dist = t; hitObstacle = null; } // a door isn't an obstacle rectangle to highlight this way
+      if (t !== null && t < dist) { dist = t; hitZone = null; } // a door isn't a zone to highlight this way
     }
-    if (hitObstacle) hitObstacles.add(hitObstacle);
+    if (hitZone) hitZones.add(hitZone);
     points.push(`${ox + dx * dist},${oy + dy * dist}`);
   }
-  return { points: points.join(' '), hitObstacles };
+  return { points: points.join(' '), hitZones };
 }
-function visibilityPolygonPoints(ox, oy, radius, obstacles, doors = [], steps = 144) {
-  return castVisibility(ox, oy, radius, obstacles, doors, steps).points;
+function visibilityPolygonPoints(ox, oy, radius, zones, doors = [], steps = 144) {
+  return castVisibility(ox, oy, radius, zones, doors, steps).points;
 }
 function clearAttackRange() { attackRangeLayer.innerHTML = ''; }
 function drawAttackRange(pin) {
   const scale = activeMap()?.scale;
   if (!scale || !pin.attackRange || !showSpeedInfo(pin)) { clearAttackRange(); return; }
   const m = activeMap();
-  const obstacles = m?.obstacles || [];
+  const zones = m?.zones || [];
   const doors = m?.doors || [];
   const normalR = pin.attackRange * scale;
-  let svg = `<polygon points="${visibilityPolygonPoints(pin.wx, pin.wy, normalR, obstacles, doors)}" fill="var(--attack)" fill-opacity="0.10" stroke="var(--attack)" stroke-opacity="0.7" stroke-width="2"/>`;
+  let svg = `<polygon points="${visibilityPolygonPoints(pin.wx, pin.wy, normalR, zones, doors)}" fill="var(--attack)" fill-opacity="0.10" stroke="var(--attack)" stroke-opacity="0.7" stroke-width="2"/>`;
   if (pin.attackLongRange) {
     const longR = pin.attackLongRange * scale;
-    svg += `<polygon points="${visibilityPolygonPoints(pin.wx, pin.wy, longR, obstacles, doors)}" fill="none" stroke="var(--attack)" stroke-opacity="0.45" stroke-width="2" stroke-dasharray="5 4"/>`;
+    svg += `<polygon points="${visibilityPolygonPoints(pin.wx, pin.wy, longR, zones, doors)}" fill="none" stroke="var(--attack)" stroke-opacity="0.45" stroke-width="2" stroke-dasharray="5 4"/>`;
   }
   attackRangeLayer.innerHTML = svg;
 }
@@ -1217,7 +1216,7 @@ function drawAttackRange(pin) {
 // is shared (matches the existing monster-reveal model: any one player pin seeing a spot means
 // the whole party does) rather than each player only seeing their own. Distance-unlimited by
 // design — like the existing LOS/attack-range math, visibility is blocked only by geometry
-// (obstacles, closed doors), not by a vision-range stat nothing in this app tracks yet.
+// (blocksLOS zones, closed doors), not by a vision-range stat nothing in this app tracks yet.
 // DM-only concept in reverse: the DM always sees the true, unfogged map — this only renders
 // for a player connection.
 //
@@ -1225,32 +1224,40 @@ function drawAttackRange(pin) {
 // tokens (pins) paint before it, so fog visually covers them in the dark like the story asked
 // ("the solid objects themselves should remain visible" — doors, and AoE templates by the same
 // existing "visible to everyone" reasoning, paint AFTER fog instead, so a door or a spell
-// marker stays visible even sitting in unlit territory, the same way solid-area geometry has
+// marker stays visible even sitting in unlit territory, the same way solid-zone geometry has
 // never been treated as secret — only creatures/tokens are meant to disappear into the dark.
 const FOG_RADIUS = 100000; // far past any realistic map extent — geometry is the only limit
-// DMs building an organic-looking feature (a bush, a rock pile) out of this tool's only
-// primitive — axis-aligned rectangles — place several overlapping/adjacent ones together (16
-// obstacles on the real campaign map turned out to be 6 such clusters of 2-3 plus 3 singles).
+// DMs building an organic-looking feature (a bush, a rock pile) out of overlapping pieces —
+// or, now that zones are polygons, still might for a quick multi-piece sketch — place several
+// overlapping/adjacent zones together (16 legacy obstacle rectangles on the real campaign map
+// turned out to be 6 such clusters of 2-3 plus 3 singles, before the migration to zones).
 // From one specific viewing angle, one piece of a cluster can fully eclipse another piece
-// directly behind it, so a per-obstacle "was this one hit by a ray" check only reveals whatever
+// directly behind it, so a per-zone "was this one hit by a ray" check only reveals whatever
 // sliver happens to face the viewer — not "the whole tree", which is what it actually looks
-// like standing next to it. So obstacles are grouped once here (any two that overlap or sit
-// within a small pad of each other join the same cluster), and revealing any single piece of a
-// cluster reveals every piece in it.
-function clusterObstacles(obstacles) {
+// like standing next to it. So blocksLOS zones are grouped once here (any two whose bounding
+// boxes overlap or sit within a small pad of each other join the same cluster), and revealing
+// any single piece of a cluster reveals every piece in it.
+function zoneBounds(zone) {
+  const xs = zone.points.map(p => p.x), ys = zone.points.map(p => p.y);
+  return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
+}
+function clusterZones(zones) {
   const PAD = 20; // world px — small gap a DM might have left between pieces of one feature
-  const overlapsOrTouches = (a, b) =>
-    !(a.x + a.w + PAD < b.x || b.x + b.w + PAD < a.x || a.y + a.h + PAD < b.y || b.y + b.h + PAD < a.y);
-  const clusterOf = new Map(); // obstacle -> array (its full cluster, itself included)
+  const bounds = new Map(zones.map(z => [z, zoneBounds(z)]));
+  const overlapsOrTouches = (a, b) => {
+    const ba = bounds.get(a), bb = bounds.get(b);
+    return !(ba.x2 + PAD < bb.x1 || bb.x2 + PAD < ba.x1 || ba.y2 + PAD < bb.y1 || bb.y2 + PAD < ba.y1);
+  };
+  const clusterOf = new Map(); // zone -> array (its full cluster, itself included)
   const visited = new Set();
-  obstacles.forEach(o => {
-    if (visited.has(o)) return;
-    const cluster = [o];
-    visited.add(o);
+  zones.forEach(z => {
+    if (visited.has(z)) return;
+    const cluster = [z];
+    visited.add(z);
     for (let i = 0; i < cluster.length; i++) {
-      obstacles.forEach(o2 => {
-        if (visited.has(o2)) return;
-        if (overlapsOrTouches(cluster[i], o2)) { cluster.push(o2); visited.add(o2); }
+      zones.forEach(z2 => {
+        if (visited.has(z2)) return;
+        if (overlapsOrTouches(cluster[i], z2)) { cluster.push(z2); visited.add(z2); }
       });
     }
     cluster.forEach(member => clusterOf.set(member, cluster));
@@ -1261,38 +1268,42 @@ function renderFog() {
   if (myRole !== 'player' || !mapCanvas.width || !mapCanvas.height) { fogLayer.innerHTML = ''; return; }
   const m = activeMap();
   if (!m) { fogLayer.innerHTML = ''; return; }
-  const obstacles = m.obstacles || [];
+  const zones = m.zones || [];
   const doors = m.doors || [];
   const w = mapCanvas.width, h = mapCanvas.height;
   const playerPins = pins.filter(p => p.type === 'player');
-  const clusterOf = clusterObstacles(obstacles);
+  const losBlockers = zones.filter(z => ZONE_KINDS[z.kind]?.blocksLOS);
+  const clusterOf = clusterZones(losBlockers);
   // Each player pin punches its own hole in the mask; a map with no player pins placed yet
   // (or none of them still there) renders fully dark, which is the correct "no vision" state.
-  // The ray-casting shadow stops exactly at an obstacle's NEAR face — correct for what's BEHIND
-  // it, but that leaves the obstacle's own footprint (the tree itself, right next to you)
+  // The ray-casting shadow stops exactly at a blocking zone's NEAR face — correct for what's
+  // BEHIND it, but that leaves the zone's own footprint (the tree itself, right next to you)
   // sitting just outside the lit polygon and getting darkened, which looks wrong up close: you
-  // can see the tree you're standing next to, just not what's past it. So every obstacle that
+  // can see the tree you're standing next to, just not what's past it. So every zone that
   // castVisibility actually stopped a ray on (collected from the very same ray-cast that draws
   // the shadow, not a separate check that could disagree with it) — and, per the clustering
   // above, everything else grouped with it — gets its own full footprint punched as a hole too.
-  const visibleObstacles = new Set();
+  // Difficult terrain never appears here since it never blocks LOS in the first place — being
+  // covered by fog when out of current vision (unlike doors/templates) is exactly what should
+  // happen to it, so it needs no special-casing at all, just normal token-layer treatment.
+  const visibleZones = new Set();
   const holes = playerPins
     .map(p => {
-      const { points, hitObstacles } = castVisibility(p.wx, p.wy, FOG_RADIUS, obstacles, doors, 144);
-      hitObstacles.forEach(o => (clusterOf.get(o) || [o]).forEach(x => visibleObstacles.add(x)));
+      const { points, hitZones } = castVisibility(p.wx, p.wy, FOG_RADIUS, zones, doors, 144);
+      hitZones.forEach(z => (clusterOf.get(z) || [z]).forEach(x => visibleZones.add(x)));
       return `<polygon points="${points}" fill="black"/>`;
     })
     .join('');
-  const visibleObstacleHoles = [...visibleObstacles]
-    .map(o => `<rect x="${o.x}" y="${o.y}" width="${o.w}" height="${o.h}" fill="black"/>`)
+  const visibleZoneHoles = [...visibleZones]
+    .map(z => `<polygon points="${z.points.map(p => `${p.x},${p.y}`).join(' ')}" fill="black"/>`)
     .join('');
-  // A soft feather on every fog edge (the vision boundary and the obstacle cutouts alike) reads
+  // A soft feather on every fog edge (the vision boundary and the zone cutouts alike) reads
   // less like a hard vector cutout and more like actual fading visibility — one blur on the
   // whole mask covers both at once.
   const blur = Math.max(6, (m.scale || 20) * 0.5);
   fogLayer.innerHTML = `
     <filter id="fogBlur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="${blur}"/></filter>
-    <mask id="fogMask"><g filter="url(#fogBlur)"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}${visibleObstacleHoles}</g></mask>
+    <mask id="fogMask"><g filter="url(#fogBlur)"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}${visibleZoneHoles}</g></mask>
     <rect x="0" y="0" width="${w}" height="${h}" fill="#05060a" fill-opacity="0.92" mask="url(#fogMask)"/>
   `;
 }
@@ -1637,6 +1648,7 @@ window.addEventListener('keydown', (e) => {
   if (e.key === 'Escape') {
     hideDistancePanel();
     if (!confirmDialog.classList.contains('hidden')) closeConfirm(false);
+    cancelZoneDraw();
   }
 });
 
@@ -1645,19 +1657,21 @@ function applyWorldTransform() { world.style.transform = `translate(${panX}px, $
 function setMode(next) {
   mode = next;
   stage.className = 'mode-' + mode;
-  [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnObstacles, btnDoors, btnAoeCone, btnAoeCircle, btnAoeLine].forEach(b => b.classList.remove('active'));
+  [btnSetScale, btnPan, btnAddPlayer, btnAddMonster, btnMeasure, btnZoneSolid, btnZoneDifficult, btnDoors, btnAoeCone, btnAoeCircle, btnAoeLine].forEach(b => b.classList.remove('active'));
   if (mode === 'set-scale') btnSetScale.classList.add('active');
   if (mode === 'pan') btnPan.classList.add('active');
   if (mode === 'add-player') btnAddPlayer.classList.add('active');
   if (mode === 'add-monster') btnAddMonster.classList.add('active');
   if (mode === 'measure') btnMeasure.classList.add('active');
-  if (mode === 'obstacles') btnObstacles.classList.add('active');
+  if (mode === 'zone-solid') btnZoneSolid.classList.add('active');
+  if (mode === 'zone-difficult') btnZoneDifficult.classList.add('active');
   if (mode === 'doors') btnDoors.classList.add('active');
   if (mode === 'aoe-cone') btnAoeCone.classList.add('active');
   if (mode === 'aoe-circle') btnAoeCircle.classList.add('active');
   if (mode === 'aoe-line') btnAoeLine.classList.add('active');
   clearMeasurement();
   hideDistancePanel();
+  cancelZoneDraw(); // switching tools mid-polygon abandons it, same as any other in-progress draft
   const mine = myRole === 'player' ? 'your' : 'a';
   const hints = {
     'no-map': myRole === 'player' ? 'Waiting for the DM to set up the map…' : 'Import a PDF battle map to begin.',
@@ -1666,7 +1680,8 @@ function setMode(next) {
     'add-player': 'Click on the map to place a player pin.',
     'add-monster': 'Click on the map to place a monster pin.',
     'measure': 'Click a start point, then an end point, to measure the distance.',
-    'obstacles': 'Drag to mark a solid area (walls, rocks, etc). Click an existing one to remove it. Only you can see these for now.',
+    'zone-solid': 'Drag for a quick rectangle, or click to place a polygon\'s corners one at a time (click back near the start to close it). Click an existing zone to remove it. Only you can see these for now.',
+    'zone-difficult': 'Drag for a quick rectangle, or click to place a polygon\'s corners one at a time (click back near the start to close it). Click an existing zone to remove it. Visible to everyone.',
     'doors': 'Drag along an opening to place a door. Click an existing one to open/close it, or hover it for a × to remove it.',
     'aoe-cone': 'Drag from the origin to aim and size a cone. Click an existing one to remove it.',
     'aoe-circle': 'Drag from the center to size a circle. Click an existing one to remove it.',
@@ -1693,7 +1708,8 @@ function updateToolbarState() {
   btnAddPlayer.disabled = !hasScale;
   btnAddMonster.disabled = !hasScale;
   btnMeasure.disabled = !hasScale;
-  btnObstacles.disabled = !hasScale;
+  btnZoneSolid.disabled = !hasScale;
+  btnZoneDifficult.disabled = !hasScale;
   btnDoors.disabled = !hasScale;
   btnAoeCone.disabled = !hasScale;
   btnAoeCircle.disabled = !hasScale;
@@ -1735,7 +1751,7 @@ async function loadActiveMap() {
   if (!m) {
     pins = [];
     renderAllPins();
-    renderObstacles();
+    renderZones();
     renderTemplates();
     renderDoors();
     renderFog();
@@ -1748,7 +1764,7 @@ async function loadActiveMap() {
   ({ panX, panY, zoom } = loadLocalView(m.id));
   applyWorldTransform();
   renderAllPins();
-  renderObstacles();
+  renderZones();
   renderTemplates();
   renderDoors();
   try {
@@ -1888,60 +1904,83 @@ function renderAllPins() {
   pins.forEach(renderPin);
 }
 
-// ── obstacles (DM-marked solid areas — line-of-sight/movement-blocking logic is future work;
-// for now this is just the authoring tool, and only the DM can see or edit them) ───────
-function renderObstacles() {
-  obstaclesLayer.innerHTML = '';
-  // The DM-only marker box (this rendering) is what stays hidden, not the underlying data —
-  // the server sends real obstacle geometry to everyone now (it was never actually secret,
-  // a tree is visibly a tree on the map), which is what lets a player's own client predict
-  // movement-blocking and compute their own attack-range shape locally. Only the authoring
-  // overlay itself is DM-only.
-  if (myRole !== 'dm') return;
-  const list = activeMap()?.obstacles || [];
-  list.forEach(o => {
-    const el = document.createElement('div');
-    el.className = 'obstacle-rect';
-    el.dataset.id = o.id;
-    el.style.left = o.x + 'px';
-    el.style.top = o.y + 'px';
-    el.style.width = o.w + 'px';
-    el.style.height = o.h + 'px';
-    el.innerHTML = '<button class="obstacle-remove" title="Remove solid area">×</button>';
-    el.querySelector('.obstacle-remove').addEventListener('click', async (e) => {
+// ── zones (DM-drawn polygons tagged with a kind — solid, difficult terrain, more later) ──
+// Whether a kind's authoring marker is player-visible is looked up per-kind (ZONE_KINDS above)
+// rather than a single "DM-only" rule the way the old rectangle-only obstacles worked: solid
+// stays DM-only (a wall is visible in the map art itself, same reasoning as always), but
+// difficult terrain isn't usually obvious from the art alone, so its marker renders for
+// players too. The server sends every zone's real geometry to everyone regardless of kind —
+// this only controls whether the *marker* renders, matching the established obstacle pattern.
+function zoneCentroid(points) {
+  return { x: points.reduce((s, p) => s + p.x, 0) / points.length, y: points.reduce((s, p) => s + p.y, 0) / points.length };
+}
+function renderZones() {
+  const list = activeMap()?.zones || [];
+  zonesLayer.innerHTML = list.map(z => {
+    const info = ZONE_KINDS[z.kind];
+    if (!info || (myRole !== 'dm' && !info.visibleToPlayers)) return '';
+    const ptsStr = z.points.map(p => `${p.x},${p.y}`).join(' ');
+    const c = zoneCentroid(z.points);
+    const remove = myRole === 'dm'
+      ? `<g class="zone-remove" transform="translate(${c.x},${c.y})"><circle r="9"/><text>×</text></g>`
+      : '';
+    return `<g class="zone-group" data-id="${z.id}"><polygon class="zone-shape kind-${z.kind}" points="${ptsStr}"/>${remove}</g>`;
+  }).join('');
+  if (myRole !== 'dm') return; // only the DM can remove a zone, regardless of who can see it
+  zonesLayer.querySelectorAll('.zone-group').forEach(el => {
+    const id = el.dataset.id;
+    el.querySelector('.zone-remove')?.addEventListener('click', async (e) => {
       e.stopPropagation();
-      const ok = await askConfirm('Remove this solid area?');
+      const ok = await askConfirm('Remove this zone?');
       if (!ok) return;
       const m = activeMap();
       if (!m) return;
-      m.obstacles = m.obstacles.filter(x => x.id !== o.id);
-      renderObstacles();
-      sendAction({ type: 'removeObstacle', mapId: m.id, obstacleId: o.id });
+      m.zones = m.zones.filter(z => z.id !== id);
+      renderZones();
+      sendAction({ type: 'removeZone', mapId: m.id, zoneId: id });
     });
-    obstaclesLayer.appendChild(el);
   });
 }
-function drawObstaclePreview(x1, y1, x2, y2) {
-  const x = Math.min(x1, x2), y = Math.min(y1, y2);
-  const w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
-  obstaclePreview.style.left = x + 'px';
-  obstaclePreview.style.top = y + 'px';
-  obstaclePreview.style.width = w + 'px';
-  obstaclePreview.style.height = h + 'px';
-  obstaclePreview.classList.remove('hidden');
+function currentZoneKind() { return mode === 'zone-difficult' ? 'difficult' : 'solid'; }
+function drawZoneRectPreview(kind, x1, y1, x2, y2) {
+  const x = Math.min(x1, x2), y = Math.min(y1, y2), w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
+  zonePreview.innerHTML = `<polygon class="zone-shape kind-${kind}" points="${x},${y} ${x + w},${y} ${x + w},${y + h} ${x},${y + h}"/>`;
+  zonePreview.classList.remove('hidden');
 }
-function clearObstaclePreview() { obstaclePreview.classList.add('hidden'); }
-function commitObstacle(x1, y1, x2, y2) {
-  const x = Math.min(x1, x2), y = Math.min(y1, y2);
-  const w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
-  if (w < 8 || h < 8) return; // filters out an accidental click/jitter, not a deliberate small mark
+// Live preview while placing a polygon one click at a time: the placed vertices as dots, a
+// dashed rubber-band line out to the cursor, and a translucent fill showing what the shape
+// would look like if closed right now (an SVG <polygon> always closes back to its first point
+// on its own, so appending the live cursor position as a trailing vertex is enough for this).
+function drawZonePolygonPreview(kind, points, cursorX, cursorY) {
+  const placedStr = points.map(p => `${p.x},${p.y}`).join(' ');
+  const withCursor = `${placedStr} ${cursorX},${cursorY}`;
+  const shape = points.length >= 2 ? `<polygon class="zone-shape kind-${kind}" points="${withCursor}"/>` : '';
+  const rubber = `<polyline class="zone-rubber" points="${withCursor}" style="stroke:var(--zone-${kind})"/>`;
+  const dots = points.map(p => `<circle class="zone-vertex" cx="${p.x}" cy="${p.y}" r="4"/>`).join('');
+  zonePreview.innerHTML = shape + rubber + dots;
+  zonePreview.classList.remove('hidden');
+}
+function clearZonePreview() { zonePreview.classList.add('hidden'); zonePreview.innerHTML = ''; }
+function commitZonePolygon(kind, points) {
   const m = activeMap();
   if (!m) return;
-  const obstacle = { id: crypto.randomUUID(), x, y, w, h };
-  if (!m.obstacles) m.obstacles = [];
-  m.obstacles.push(obstacle);
-  renderObstacles();
-  sendAction({ type: 'addObstacle', mapId: m.id, obstacle });
+  const zone = { id: crypto.randomUUID(), kind, points: points.map(p => ({ x: p.x, y: p.y })) };
+  if (!m.zones) m.zones = [];
+  m.zones.push(zone);
+  renderZones();
+  sendAction({ type: 'addZone', mapId: m.id, zone });
+}
+function commitZoneRect(kind, x1, y1, x2, y2) {
+  const x = Math.min(x1, x2), y = Math.min(y1, y2), w = Math.abs(x2 - x1), h = Math.abs(y2 - y1);
+  if (w < 8 || h < 8) return; // filters out an accidental click/jitter, not a deliberate small mark
+  commitZonePolygon(kind, [{ x, y }, { x: x + w, y }, { x: x + w, y: y + h }, { x, y: y + h }]);
+}
+// Cancels whatever's in progress (an unfinished multi-click polygon, or a pending click that
+// hasn't yet resolved into either a rectangle drag or a polygon's first vertex).
+function cancelZoneDraw() {
+  zoneDrawState = null;
+  zoneClickStart = null;
+  clearZonePreview();
 }
 
 // ── AoE spell-area templates (cone/circle/line) — visible to everyone, DM places for now ──
@@ -2100,7 +2139,13 @@ function drawMeasureLine(p1, p2) {
 
 // ── stage interaction (drag to pan, click to act, pinch to zoom) ─────
 let dragState = null;
-let obstacleDragState = null; // separate from dragState: a drag in 'obstacles' mode draws a rectangle instead of panning
+// Zone drawing supports two gestures from the same tool: drag for a quick rectangle, or click
+// repeatedly to place a polygon's corners one at a time. zoneClickStart tracks only the very
+// first pointerdown-to-pointerup of a fresh shape, to tell which one the user meant; once
+// that's resolved as "a plain click", zoneDrawState takes over and persists across the
+// following clicks (each one just adds a vertex) until the shape is closed or cancelled.
+let zoneClickStart = null; // { screenX, screenY, worldX, worldY, moved }
+let zoneDrawState = null; // { kind, points: [{x,y},...] }
 let templateDragState = null; // same idea, for the three 'aoe-*' modes
 let doorDragState = null; // same idea, for 'doors' mode — a two-point drag like the AoE line tool
 // Two simultaneous pointers on the stage background (not started on a pin) means a touch
@@ -2129,7 +2174,7 @@ function endTouch(pointerId) {
 }
 
 stage.addEventListener('pointerdown', (e) => {
-  // turnOrderPanel, obstacle-remove, aoe-remove and pin-remove all live inside #stage (so they
+  // turnOrderPanel, zone-remove, aoe-remove and pin-remove all live inside #stage (so they
   // can be positioned relative to the map), but they're their own UI, not part of the map
   // surface — without this guard, a real pointerdown on any of them still bubbles up and stage
   // claims pointer capture for itself before the control's own click handler ever runs, silently
@@ -2140,7 +2185,7 @@ stage.addEventListener('pointerdown', (e) => {
   // the common case of removing a pin while in Move mode — covering it here too so removing a
   // pin isn't quietly broken in every other mode. door-hit (its click-to-toggle target) and
   // door-remove need the same treatment, applied up front this time instead of rediscovering it.
-  if (e.target.closest('#turnOrderPanel, .obstacle-remove, .aoe-remove, .pin-remove, .door-hit, .door-remove')) return;
+  if (e.target.closest('#turnOrderPanel, .zone-remove, .aoe-remove, .pin-remove, .door-hit, .door-remove')) return;
   if ((mode === 'pan' && e.target.closest('.pin')) || mode === 'no-map') return;
   hideDistancePanel();
   safeCapture(stage, e.pointerId);
@@ -2151,11 +2196,17 @@ stage.addEventListener('pointerdown', (e) => {
     if (activeTouches.size > 2) return; // ignore a third finger
   }
 
-  if (mode === 'obstacles' && myRole === 'dm' && !e.target.closest('.obstacle-rect')) {
+  if ((mode === 'zone-solid' || mode === 'zone-difficult') && myRole === 'dm' && !e.target.closest('.zone-shape')) {
     const rect = stage.getBoundingClientRect();
     const worldX = ((e.clientX - rect.left) - panX) / zoom;
     const worldY = ((e.clientY - rect.top) - panY) / zoom;
-    obstacleDragState = { startWorldX: worldX, startWorldY: worldY, moved: false };
+    if (!zoneDrawState) {
+      // First gesture of a fresh shape — don't know yet whether this becomes a drag (quick
+      // rectangle) or resolves as a plain click (the polygon's first vertex); pointerup decides.
+      zoneClickStart = { screenX: e.clientX, screenY: e.clientY, worldX, worldY, moved: false };
+    }
+    // For the 2nd+ vertex there's nothing to do on pointerdown — it's added on pointerup
+    // instead, at wherever the pointer actually is by then.
     return;
   }
   if (mode.startsWith('aoe-') && myRole === 'dm' && !e.target.closest('.aoe-shape, .aoe-remove')) {
@@ -2178,11 +2229,28 @@ stage.addEventListener('pointerdown', (e) => {
 stage.addEventListener('pointermove', (e) => {
   if (activeTouches.has(e.pointerId)) activeTouches.set(e.pointerId, { x: e.clientX, y: e.clientY });
 
-  if (obstacleDragState) {
+  if (zoneClickStart) {
+    // Still resolving the very first gesture of a fresh shape: only once it's moved past the
+    // click-jitter threshold do we know it's a drag, and only then start previewing it as a
+    // quick rectangle — until that happens this stays silent so a plain click never flashes
+    // an unwanted rectangle preview.
+    const dx = e.clientX - zoneClickStart.screenX, dy = e.clientY - zoneClickStart.screenY;
+    if (Math.abs(dx) + Math.abs(dy) > 4) zoneClickStart.moved = true;
+    if (zoneClickStart.moved) {
+      const rect = stage.getBoundingClientRect();
+      const worldX = ((e.clientX - rect.left) - panX) / zoom;
+      const worldY = ((e.clientY - rect.top) - panY) / zoom;
+      drawZoneRectPreview(currentZoneKind(), zoneClickStart.worldX, zoneClickStart.worldY, worldX, worldY);
+    }
+    return;
+  }
+  if (zoneDrawState) {
+    // Placing a polygon one click at a time — this fires on every hover move (not just while
+    // a button is held), so the rubber-band line tracks the cursor between clicks.
     const rect = stage.getBoundingClientRect();
     const worldX = ((e.clientX - rect.left) - panX) / zoom;
     const worldY = ((e.clientY - rect.top) - panY) / zoom;
-    drawObstaclePreview(obstacleDragState.startWorldX, obstacleDragState.startWorldY, worldX, worldY);
+    drawZonePolygonPreview(zoneDrawState.kind, zoneDrawState.points, worldX, worldY);
     return;
   }
   if (templateDragState) {
@@ -2232,14 +2300,41 @@ stage.addEventListener('pointerup', (e) => {
     endTouch(e.pointerId);
     if (wasPinching) return; // don't treat the lifted finger as a click
   }
-  if (obstacleDragState) {
+  if (zoneClickStart) {
     const rect = stage.getBoundingClientRect();
     const worldX = ((e.clientX - rect.left) - panX) / zoom;
     const worldY = ((e.clientY - rect.top) - panY) / zoom;
     safeRelease(stage, e.pointerId);
-    commitObstacle(obstacleDragState.startWorldX, obstacleDragState.startWorldY, worldX, worldY);
-    obstacleDragState = null;
-    clearObstaclePreview();
+    const kind = currentZoneKind();
+    if (zoneClickStart.moved) {
+      // Resolved as a drag: commit the quick rectangle immediately, no further clicks needed.
+      commitZoneRect(kind, zoneClickStart.worldX, zoneClickStart.worldY, worldX, worldY);
+      clearZonePreview();
+    } else {
+      // Resolved as a plain click: this is the polygon's first vertex — stay in drawing mode
+      // and wait for more clicks rather than committing anything yet.
+      zoneDrawState = { kind, points: [{ x: zoneClickStart.worldX, y: zoneClickStart.worldY }] };
+      drawZonePolygonPreview(kind, zoneDrawState.points, worldX, worldY);
+    }
+    zoneClickStart = null;
+    return;
+  }
+  if (zoneDrawState) {
+    const rect = stage.getBoundingClientRect();
+    const worldX = ((e.clientX - rect.left) - panX) / zoom;
+    const worldY = ((e.clientY - rect.top) - panY) / zoom;
+    safeRelease(stage, e.pointerId);
+    const first = zoneDrawState.points[0];
+    const closeDistPx = Math.hypot(worldX - first.x, worldY - first.y) * zoom; // world -> screen px
+    if (zoneDrawState.points.length >= 3 && closeDistPx < 12) {
+      // Clicked back near the start with enough vertices already placed — close the shape.
+      commitZonePolygon(zoneDrawState.kind, zoneDrawState.points);
+      zoneDrawState = null;
+      clearZonePreview();
+    } else {
+      zoneDrawState.points.push({ x: worldX, y: worldY });
+      drawZonePolygonPreview(zoneDrawState.kind, zoneDrawState.points, worldX, worldY);
+    }
     return;
   }
   if (templateDragState) {
@@ -2271,8 +2366,7 @@ stage.addEventListener('pointerup', (e) => {
 });
 
 stage.addEventListener('pointercancel', (e) => {
-  obstacleDragState = null;
-  clearObstaclePreview();
+  cancelZoneDraw();
   templateDragState = null;
   clearTemplatePreview();
   doorDragState = null;
@@ -2392,7 +2486,8 @@ btnPan.addEventListener('click', () => setMode('pan'));
 btnAddPlayer.addEventListener('click', () => setMode('add-player'));
 btnAddMonster.addEventListener('click', () => setMode('add-monster'));
 btnMeasure.addEventListener('click', () => setMode('measure'));
-btnObstacles.addEventListener('click', () => setMode('obstacles'));
+btnZoneSolid.addEventListener('click', () => setMode('zone-solid'));
+btnZoneDifficult.addEventListener('click', () => setMode('zone-difficult'));
 btnDoors.addEventListener('click', () => setMode('doors'));
 btnAoeCone.addEventListener('click', () => setMode('aoe-cone'));
 btnAoeCircle.addEventListener('click', () => setMode('aoe-circle'));

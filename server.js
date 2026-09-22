@@ -46,8 +46,23 @@ function defaultInitiative() {
 for (const map of Object.values(state.maps)) {
   if (!map.initiative) map.initiative = defaultInitiative();
   else if (!map.initiative.traveled) map.initiative.traveled = {};
-  if (!map.obstacles) map.obstacles = [];
   if (!map.templates) map.templates = [];
+  if (!map.doors) map.doors = [];
+  // "Solid areas" (rectangles) generalized into zones (arbitrary polygons tagged with a
+  // kind — see ZONE_KINDS below). A rectangle is just a 4-point polygon, so existing
+  // obstacles migrate losslessly into zones tagged kind:'solid' the first time a map saved
+  // before this existed loads.
+  if (!map.zones) {
+    map.zones = (map.obstacles || []).map(o => ({
+      id: o.id,
+      kind: 'solid',
+      points: [
+        { x: o.x, y: o.y }, { x: o.x + o.w, y: o.y },
+        { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h },
+      ],
+    }));
+    delete map.obstacles;
+  }
 }
 
 function activeEntry(map) {
@@ -142,7 +157,7 @@ app.post('/api/maps', requireBasicAuth, (req, res) => {
       file: `${id}.pdf`,
       scale: null, // pixels-per-foot, set by clicking two points a known distance apart
       pins: [], // { id, type: 'player'|'monster', name, color, icon, speed, attackRange, attackLongRange, hpMax, hpCurrent, conditions, hidden, wx, wy }
-      obstacles: [], // { id, x, y, w, h } — DM-marked solid rectangles; geometry visible to everyone, only the DM's marker box in the UI is hidden (see stateForConnection)
+      zones: [], // { id, kind: 'solid'|'difficult', points: [{x,y},...] } — see ZONE_KINDS; geometry visible to everyone, whether the DM's marker/authoring box is player-visible depends on kind (see stateForConnection and ZONE_KINDS.visibleToPlayers client-side)
       templates: [], // { id, shape: 'cone'|'circle'|'line', x, y, angle, length, radius, width } — visible to everyone
       doors: [], // { id, x1, y1, x2, y2, open } — blocks LOS/movement like an obstacle edge while closed; DM-only to place/remove/toggle, geometry and open/closed state visible to everyone (same reasoning as obstacles — a door is not secret, only the authoring controls are)
       initiative: defaultInitiative(),
@@ -170,23 +185,36 @@ app.delete('/api/maps/:id', requireBasicAuth, (req, res) => {
   res.json(state);
 });
 
+// ── zones ──────────────────────────────────────────────────────────────
+// A zone's kind determines its behavior — table-driven so a new kind later is one row here,
+// not scattered special-casing through LOS/movement/rendering code. costMultiplier isn't
+// enforced yet (difficult terrain is a visible marker for now, not auto-applied movement
+// math — a deliberate first-pass scoping, see the story this was built from) but is recorded
+// for when that gets picked up, so the data model doesn't need to change again for it.
+const ZONE_KINDS = {
+  solid:     { blocksLOS: true,  blocksMovement: true,  costMultiplier: 1 },
+  difficult: { blocksLOS: false, blocksMovement: false, costMultiplier: 2 },
+};
+
 // ── line of sight ─────────────────────────────────────────────────────
-// Each obstacle rectangle blocks sight along its 4 edges; two points have LOS
-// if the segment between them crosses none of those edges, for any obstacle.
+// A zone whose kind blocks LOS blocks sight along all of its polygon edges (a rectangle is
+// just the 4-edge case); two points have LOS if the segment between them crosses none of
+// those edges, for any blocking zone.
 function segmentsIntersect(p1, p2, p3, p4) {
   const cross = (o, a, b) => (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x);
   const d1 = cross(p3, p4, p1), d2 = cross(p3, p4, p2);
   const d3 = cross(p1, p2, p3), d4 = cross(p1, p2, p4);
   return ((d1 > 0 && d2 < 0) || (d1 < 0 && d2 > 0)) && ((d3 > 0 && d4 < 0) || (d3 < 0 && d4 > 0));
 }
-// A closed door blocks like an obstacle edge; an open one blocks nothing — same segment-
-// intersection test, just a single segment per door instead of 4 per rectangle.
-function hasLOS(a, b, obstacles, doors) {
+// A closed door blocks like a solid zone edge; an open one blocks nothing — same segment-
+// intersection test, just a single fixed segment per door instead of a polygon's worth.
+function hasLOS(a, b, zones, doors) {
   const pa = { x: a.wx, y: a.wy }, pb = { x: b.wx, y: b.wy };
-  for (const o of obstacles) {
-    const c = [{ x: o.x, y: o.y }, { x: o.x + o.w, y: o.y }, { x: o.x + o.w, y: o.y + o.h }, { x: o.x, y: o.y + o.h }];
-    for (let i = 0; i < 4; i++) {
-      if (segmentsIntersect(pa, pb, c[i], c[(i + 1) % 4])) return false;
+  for (const z of zones) {
+    if (!ZONE_KINDS[z.kind]?.blocksLOS) continue;
+    const pts = z.points;
+    for (let i = 0; i < pts.length; i++) {
+      if (segmentsIntersect(pa, pb, pts[i], pts[(i + 1) % pts.length])) return false;
     }
   }
   for (const d of doors || []) {
@@ -194,6 +222,25 @@ function hasLOS(a, b, obstacles, doors) {
     if (segmentsIntersect(pa, pb, { x: d.x1, y: d.y1 }, { x: d.x2, y: d.y2 })) return false;
   }
   return true;
+}
+// Same shape as hasLOS but reads blocksMovement instead of blocksLOS — kept as its own
+// function rather than reusing hasLOS, since every kind so far happens to set both flags the
+// same way but a future one (e.g. cover that blocks sight without blocking movement, or the
+// reverse) shouldn't require re-coupling this.
+function movementBlockedBy(fromWx, fromWy, toWx, toWy, zones, doors) {
+  const pa = { x: fromWx, y: fromWy }, pb = { x: toWx, y: toWy };
+  for (const z of zones) {
+    if (!ZONE_KINDS[z.kind]?.blocksMovement) continue;
+    const pts = z.points;
+    for (let i = 0; i < pts.length; i++) {
+      if (segmentsIntersect(pa, pb, pts[i], pts[(i + 1) % pts.length])) return true;
+    }
+  }
+  for (const d of doors || []) {
+    if (d.open) continue;
+    if (segmentsIntersect(pa, pb, { x: d.x1, y: d.y1 }, { x: d.x2, y: d.y2 })) return true;
+  }
+  return false;
 }
 
 // ── realtime layer ────────────────────────────────────────────────────
@@ -212,13 +259,13 @@ function stateForConnection(conn) {
   if (conn.role === 'dm') return state;
   const maps = {};
   for (const [id, map] of Object.entries(state.maps)) {
-    // Obstacle geometry itself isn't secret — a tree is a tree, players can see it's an
-    // obstacle right there on the map image — so the raw rectangles are sent to everyone.
-    // What stays DM-only is purely the authoring marker (the hatched box + remove control):
-    // renderObstacles() in index.html gates that rendering on role, not this. Sending the
-    // real geometry to players is also what lets their own client predict movement-blocking
-    // and compute their own attack-range shape locally, instead of only finding out from a
-    // server rejection after the fact.
+    // Zone geometry itself isn't secret — a wall (or a patch of mud) is right there on the
+    // map — so the raw polygons are sent to everyone regardless of kind. Whether the DM's
+    // authoring marker itself is player-visible is a per-kind, client-side rendering decision
+    // (see ZONE_KINDS.visibleToPlayers and renderZones() in index.html), not something this
+    // state filtering does. Sending the real geometry to players is also what lets their own
+    // client predict movement-blocking and compute their own attack-range shape locally,
+    // instead of only finding out from a server rejection after the fact.
     //
     // A monster pin is only sent to a player at all if SOME player pin has line of sight to
     // it (shared party vision: once the party can see a monster, everyone in the party knows
@@ -230,8 +277,8 @@ function stateForConnection(conn) {
     const playerPins = map.pins.filter(p => p.type === 'player');
     const myPin = map.pins.find(p => p.id === conn.pinId);
     const pins = map.pins
-      .filter(p => p.type !== 'monster' || playerPins.some(pp => hasLOS(pp, p, map.obstacles, map.doors)))
-      .map(p => p.type !== 'monster' ? p : { ...p, losFromMe: !!myPin && hasLOS(myPin, p, map.obstacles, map.doors) });
+      .filter(p => p.type !== 'monster' || playerPins.some(pp => hasLOS(pp, p, map.zones, map.doors)))
+      .map(p => p.type !== 'monster' ? p : { ...p, losFromMe: !!myPin && hasLOS(myPin, p, map.zones, map.doors) });
     maps[id] = { ...map, pins };
   }
   return { ...state, maps };
@@ -332,13 +379,12 @@ function handleMessage(conn, msg) {
         if (map.initiative?.active && !isActiveTurn) return; // and only on your own turn once combat has started
       }
 
-      // Solid areas block movement outright, regardless of turn state — a wall doesn't care
-      // whose turn it is. First pass: reject the whole move if its straight line crosses one,
-      // rather than sliding the pin to the point of contact (see the story this was built
-      // from). Reuses the same hasLOS check LOS filtering uses — "does a straight line cross
-      // any obstacle edge" is exactly what both need. The DM is exempt — walls constrain
-      // players, not the DM repositioning a pin for story/staging reasons.
-      if (conn.role !== 'dm' && !hasLOS(pin, { wx: msg.wx, wy: msg.wy }, map.obstacles, map.doors)) return;
+      // A blocksMovement zone (solid) blocks movement outright, regardless of turn state — a
+      // wall doesn't care whose turn it is. First pass: reject the whole move if its straight
+      // line crosses one, rather than sliding the pin to the point of contact (see the story
+      // this was built from). The DM is exempt — walls constrain players, not the DM
+      // repositioning a pin for story/staging reasons.
+      if (conn.role !== 'dm' && movementBlockedBy(pin.wx, pin.wy, msg.wx, msg.wy, map.zones, map.doors)) return;
 
       let wx = msg.wx, wy = msg.wy;
       if (conn.role === 'player' && isActiveTurn && pin.speed && map.scale) {
@@ -385,21 +431,26 @@ function handleMessage(conn, msg) {
       map.scale = msg.scale;
       break;
     }
-    case 'addObstacle': {
+    case 'addZone': {
       if (conn.role !== 'dm') return;
       const map = state.maps[msg.mapId];
-      const o = msg.obstacle;
-      if (!map || !o || !(o.w > 0) || !(o.h > 0)) return;
-      map.obstacles.push({ id: o.id || crypto.randomUUID(), x: o.x, y: o.y, w: o.w, h: o.h });
+      const z = msg.zone;
+      if (!map || !z || !ZONE_KINDS[z.kind] || !Array.isArray(z.points)) return;
+      const points = z.points
+        .map(p => ({ x: p.x, y: p.y }))
+        .filter(p => Number.isFinite(p.x) && Number.isFinite(p.y));
+      if (points.length < 3) return; // not a valid polygon
+      if (!map.zones) map.zones = [];
+      map.zones.push({ id: z.id || crypto.randomUUID(), kind: z.kind, points });
       break;
     }
-    case 'removeObstacle': {
+    case 'removeZone': {
       if (conn.role !== 'dm') return;
       const map = state.maps[msg.mapId];
-      if (!map) return;
-      const idx = map.obstacles.findIndex(o => o.id === msg.obstacleId);
+      if (!map?.zones) return;
+      const idx = map.zones.findIndex(z => z.id === msg.zoneId);
       if (idx === -1) return;
-      map.obstacles.splice(idx, 1);
+      map.zones.splice(idx, 1);
       break;
     }
     case 'addDoor': {
