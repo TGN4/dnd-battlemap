@@ -325,8 +325,21 @@
     font-size: 13px; line-height: 1; padding: 2px 4px; cursor: pointer;
   }
   #distancePanel button.dp-icon:hover { color: var(--text); }
-  #distancePanel .dp-conditions:not(:empty) { margin: 8px 0; }
+  #distancePanel .dp-conditions:not(:empty) { margin: 0 0 8px; }
+  #distancePanel .dp-conditions.collapsed { display: none; }
   #distancePanel .dp-icon-grid:not(:empty) { margin: 8px 0; }
+  #distancePanel .dp-section-toggle {
+    display: flex; align-items: center; gap: 5px; width: 100%;
+    background: none; border: none; color: var(--muted);
+    font-size: 12px; padding: 4px 0; margin-top: 4px; cursor: pointer; text-align: left;
+  }
+  #distancePanel .dp-section-toggle:hover { color: var(--text); }
+  #distancePanel .dp-chevron { display: inline-block; font-size: 10px; transition: transform .15s; }
+  #distancePanel .dp-section-toggle.expanded .dp-chevron { transform: rotate(90deg); }
+  #distancePanel .dp-badge {
+    background: var(--accent); color: #fff; border-radius: 9px;
+    font-size: 10px; line-height: 1; padding: 2px 6px; font-weight: 600;
+  }
   #distancePanel .icon-chip { width: 26px; height: 26px; font-size: 14px; }
   #distancePanel ul { list-style: none; margin: 0; padding: 0; }
   #distancePanel li {
@@ -608,7 +621,10 @@
     </span>
   </div>
   <div id="dpIconPicker" class="icon-grid dp-icon-grid"></div>
-  <div id="dpConditions" class="condition-grid dp-conditions"></div>
+  <button type="button" id="dpConditionsToggle" class="dp-section-toggle">
+    <span class="dp-chevron">▸</span>Conditions<span id="dpConditionsBadge" class="dp-badge hidden"></span>
+  </button>
+  <div id="dpConditions" class="condition-grid dp-conditions collapsed"></div>
   <ul id="dpList"></ul>
 </div>
 
@@ -716,6 +732,8 @@ const dpHpRow           = document.getElementById('dpHpRow');
 const dpHpInput          = document.getElementById('dpHpInput');
 const dpHpMax             = document.getElementById('dpHpMax');
 const dpConditions        = document.getElementById('dpConditions');
+const dpConditionsToggle  = document.getElementById('dpConditionsToggle');
+const dpConditionsBadge   = document.getElementById('dpConditionsBadge');
 const dpIconPicker        = document.getElementById('dpIconPicker');
 const dpList           = document.getElementById('dpList');
 const dpClose           = document.getElementById('dpClose');
@@ -783,6 +801,11 @@ let panX = 0, panY = 0, zoom = 1;  // view transform (world/map px -> screen) �
 
 let pendingPoint = null;    // {x,y} first click of an in-progress measurement or scale-setting
 let currentPanelPinId = null;
+// Collapsed by default — the full 5e condition list is long enough to dominate the popup.
+// A single session-wide flag (not per-pin) since it's a density preference, not per-pin state;
+// the badge on the collapsed header still surfaces an active count so nothing gets missed.
+let dpConditionsExpanded = false;
+let dpAnchorX = 0, dpAnchorY = 0;
 let missingPinWarned = false;
 
 // ── helpers ─────────────────────────────────────────────────────────
@@ -1607,8 +1630,15 @@ btnStopCombat.addEventListener('click', async () => {
 
 // ── distances-on-click panel ──────────────────────────────────────────
 function hideDistancePanel() { distancePanel.classList.add('hidden'); currentPanelPinId = null; clearRange(); clearAttackRange(); }
+function repositionDistancePanel() {
+  const w = distancePanel.offsetWidth, h = distancePanel.offsetHeight;
+  distancePanel.style.left = Math.max(4, Math.min(dpAnchorX + 12, window.innerWidth - w - 4)) + 'px';
+  distancePanel.style.top = Math.max(4, Math.min(dpAnchorY + 12, window.innerHeight - h - 4)) + 'px';
+}
 function showDistancePanel(pin, screenX, screenY) {
   currentPanelPinId = pin.id;
+  dpAnchorX = screenX;
+  dpAnchorY = screenY;
   drawRange(pin);
   drawAttackRange(pin);
   const scale = activeMap()?.scale || 1;
@@ -1668,18 +1698,28 @@ function showDistancePanel(pin, screenX, screenY) {
     const set = new Set(pin.conditions || []);
     e.target.checked ? set.add(id) : set.delete(id);
     pin.conditions = [...set];
+    dpConditionsBadge.textContent = set.size;
+    dpConditionsBadge.classList.toggle('hidden', set.size === 0);
     renderAllPins();
     sendAction({ type: 'editPin', mapId: state.activeMapId, pinId: pin.id, patch: { conditions: pin.conditions } });
   } : null;
+  dpConditionsToggle.classList.toggle('expanded', dpConditionsExpanded);
+  dpConditions.classList.toggle('collapsed', !dpConditionsExpanded);
+  dpConditionsBadge.textContent = pinConditions.size;
+  dpConditionsBadge.classList.toggle('hidden', pinConditions.size === 0);
   dpList.innerHTML = rows.length
     ? rows.map(r => `<li><span class="dp-dot" style="background:${r.color}"></span>${escapeHtml(r.name)}<span class="dp-ft">${r.feet.toFixed(0)} ft</span></li>`).join('')
     : '<li class="dp-empty">No other pins yet.</li>';
 
   distancePanel.classList.remove('hidden');
-  const w = distancePanel.offsetWidth, h = distancePanel.offsetHeight;
-  distancePanel.style.left = Math.max(4, Math.min(screenX + 12, window.innerWidth - w - 4)) + 'px';
-  distancePanel.style.top = Math.max(4, Math.min(screenY + 12, window.innerHeight - h - 4)) + 'px';
+  repositionDistancePanel();
 }
+dpConditionsToggle.addEventListener('click', () => {
+  dpConditionsExpanded = !dpConditionsExpanded;
+  dpConditionsToggle.classList.toggle('expanded', dpConditionsExpanded);
+  dpConditions.classList.toggle('collapsed', !dpConditionsExpanded);
+  repositionDistancePanel();
+});
 dpClose.addEventListener('click', hideDistancePanel);
 dpLink.addEventListener('click', async () => {
   const pin = pins.find(p => p.id === currentPanelPinId);
