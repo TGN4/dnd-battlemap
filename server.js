@@ -245,6 +245,85 @@ function movementBlockedBy(fromWx, fromWy, toWx, toWy, zones, doors) {
   }
   return false;
 }
+// Standard ray-casting / even-odd point-in-polygon test.
+function pointInPolygon(x, y, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const xi = points[i].x, yi = points[i].y, xj = points[j].x, yj = points[j].y;
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+// 5e rule: difficult terrain doesn't stack (two overlapping patches still just cost double,
+// not quadruple) — so this is the MAX multiplier among every non-blocking zone containing the
+// point, not a sum or product. blocksMovement zones are excluded entirely: they're handled as
+// an outright block (movementBlockedBy above), not a cost, and a pin should never legally be
+// standing inside one to query a multiplier for in the first place.
+function costMultiplierAt(x, y, zones) {
+  let mult = 1;
+  for (const z of zones) {
+    const info = ZONE_KINDS[z.kind];
+    if (!info || info.blocksMovement || info.costMultiplier <= mult) continue;
+    if (pointInPolygon(x, y, z.points)) mult = info.costMultiplier;
+  }
+  return mult;
+}
+// Parametric segment-vs-segment intersection bounded to both segments (t, s both in [0,1]),
+// unlike segmentsIntersect (a plain boolean) or rayIntersectsSegment-style helpers (an
+// unbounded ray) — this one needs the actual crossing point along a finite drag path, not just
+// whether it crosses.
+function segmentIntersectionT(x1, y1, x2, y2, p3, p4) {
+  const d1x = x2 - x1, d1y = y2 - y1;
+  const d2x = p4.x - p3.x, d2y = p4.y - p3.y;
+  const denom = d1x * d2y - d1y * d2x;
+  if (Math.abs(denom) < 1e-10) return null; // parallel
+  const t = ((p3.x - x1) * d2y - (p3.y - y1) * d2x) / denom;
+  const s = ((p3.x - x1) * d1y - (p3.y - y1) * d1x) / denom;
+  if (t >= 0 && t <= 1 && s >= 0 && s <= 1) return t;
+  return null;
+}
+// Walks a straight drag path from (fromX,fromY) to (toX,toY), charging costMultiplier-weighted
+// distance against `budget` instead of plain euclidean distance, and returns where the pin
+// actually ends up once the budget runs out (which may be short of the requested destination).
+// Only ever called on a path already confirmed clear of blocksMovement zones — movePin checks
+// that separately and rejects the whole move outright rather than sliding to a wall, so this
+// only ever has to reason about *cost*, not blocking.
+//
+// Splits the path at every point it crosses a costly zone's boundary, then walks those
+// sub-segments in order — each one has a single, well-defined multiplier throughout (sampled
+// at its midpoint), so the running cost total is exact, not an approximation. If the budget
+// runs out partway through a sub-segment, that sub-segment's own multiplier gives the exact
+// stopping point by simple division, rather than an angular/stepped approximation.
+function traceCostAlongPath(fromX, fromY, toX, toY, zones, budget) {
+  const totalDist = Math.hypot(toX - fromX, toY - fromY);
+  if (totalDist === 0) return { x: fromX, y: fromY, costUsed: 0 };
+  const breakpoints = new Set([0, 1]);
+  for (const z of zones) {
+    const info = ZONE_KINDS[z.kind];
+    if (!info || info.blocksMovement || info.costMultiplier === 1) continue;
+    const pts = z.points;
+    for (let i = 0; i < pts.length; i++) {
+      const t = segmentIntersectionT(fromX, fromY, toX, toY, pts[i], pts[(i + 1) % pts.length]);
+      if (t !== null) breakpoints.add(t);
+    }
+  }
+  const sorted = [...breakpoints].sort((a, b) => a - b);
+  let costSoFar = 0;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const t0 = sorted[i], t1 = sorted[i + 1];
+    const midT = (t0 + t1) / 2;
+    const mult = costMultiplierAt(fromX + (toX - fromX) * midT, fromY + (toY - fromY) * midT, zones);
+    const segDist = totalDist * (t1 - t0);
+    const segCost = segDist * mult;
+    if (costSoFar + segCost > budget) {
+      const partialDist = (budget - costSoFar) / mult;
+      const stopT = t0 + (partialDist / totalDist);
+      return { x: fromX + (toX - fromX) * stopT, y: fromY + (toY - fromY) * stopT, costUsed: budget };
+    }
+    costSoFar += segCost;
+  }
+  return { x: toX, y: toY, costUsed: costSoFar };
+}
 
 // ── realtime layer ────────────────────────────────────────────────────
 // Every connection is either the DM (full control), a player linked to one pin id (can only
@@ -391,21 +470,21 @@ function handleMessage(conn, msg) {
 
       let wx = msg.wx, wy = msg.wy;
       if (conn.role === 'player' && isActiveTurn && pin.speed && map.scale) {
-        // Clamp against the REMAINING budget (total speed minus what's already been moved
+        // Clamp against the REMAINING budget (total speed minus what's already been spent
         // this turn), anchored to the pin's current position — not a fresh speed's worth
         // measured from wherever the turn began — so a move → action → move again sequence
-        // is held to one total speed, however many separate drags it's split across.
+        // is held to one total speed, however many separate drags it's split across. "Spent"
+        // is cost-weighted distance, not raw distance: crossing difficult terrain or water
+        // charges costMultiplier feet of budget per foot actually moved (5e's real rule),
+        // computed exactly by traceCostAlongPath rather than a flat ratio — a drag that starts
+        // in normal terrain and crosses into a costly zone partway through correctly spends
+        // less total distance than an equally-long drag entirely in the open.
         const maxTotal = pin.speed * map.scale;
         const traveled = map.initiative.traveled[pin.id] || 0;
         const remaining = Math.max(0, maxTotal - traveled);
-        const dx = wx - pin.wx, dy = wy - pin.wy;
-        const dist = Math.hypot(dx, dy);
-        if (dist > remaining && dist > 0) {
-          const ratio = remaining / dist;
-          wx = pin.wx + dx * ratio;
-          wy = pin.wy + dy * ratio;
-        }
-        map.initiative.traveled[pin.id] = traveled + Math.hypot(wx - pin.wx, wy - pin.wy);
+        const result = traceCostAlongPath(pin.wx, pin.wy, wx, wy, map.zones, remaining);
+        wx = result.x; wy = result.y;
+        map.initiative.traveled[pin.id] = traveled + result.costUsed;
       }
       pin.wx = wx;
       pin.wy = wy;

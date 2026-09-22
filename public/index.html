@@ -816,21 +816,19 @@ function canDragNow(pin) {
 // `anchor` is the pin's position when THIS drag began (not the turn's start position):
 // clamping against the remaining budget (speed minus however much was already moved
 // this turn) lets a move → action → move-again sequence still add up to one total speed.
+// Returns { wx, wy, costUsed } — costUsed is cost-weighted distance actually spent (see
+// traceCostAlongPath below), not necessarily the raw distance to the returned point.
 function clampToSpeed(pin, wx, wy, anchor) {
   // The DM can reposition any pin anywhere, any time, for story/staging reasons — the speed
   // budget only constrains a player moving their own pin on their own turn.
-  if (myRole !== 'player') return { wx, wy };
-  if (!isActiveTurnPin(pin)) return { wx, wy };
+  if (myRole !== 'player') return { wx, wy, costUsed: Math.hypot(wx - anchor.wx, wy - anchor.wy) };
+  if (!isActiveTurnPin(pin)) return { wx, wy, costUsed: Math.hypot(wx - anchor.wx, wy - anchor.wy) };
   const m = activeMap();
-  if (!pin.speed || !m?.scale) return { wx, wy };
+  if (!pin.speed || !m?.scale) return { wx, wy, costUsed: Math.hypot(wx - anchor.wx, wy - anchor.wy) };
   const maxTotal = pin.speed * m.scale;
   const traveled = m.initiative?.traveled?.[pin.id] || 0;
   const remaining = Math.max(0, maxTotal - traveled);
-  const dx = wx - anchor.wx, dy = wy - anchor.wy;
-  const dist = Math.hypot(dx, dy);
-  if (dist <= remaining || dist === 0) return { wx, wy };
-  const ratio = remaining / dist;
-  return { wx: anchor.wx + dx * ratio, wy: anchor.wy + dy * ratio };
+  return traceCostAlongPath(anchor.wx, anchor.wy, wx, wy, m.zones || [], remaining);
 }
 // A zone's kind determines its behavior — table-driven so a new kind later is one row here
 // (plus a render style below), not scattered special-casing through LOS/movement/rendering
@@ -873,6 +871,74 @@ function movementBlockedBy(fromWx, fromWy, toWx, toWy, zones, doors) {
 function pathBlocked(fromWx, fromWy, toWx, toWy) {
   const m = activeMap();
   return movementBlockedBy(fromWx, fromWy, toWx, toWy, m?.zones || [], m?.doors || []);
+}
+// Standard ray-casting / even-odd point-in-polygon test.
+function pointInPolygon(x, y, points) {
+  let inside = false;
+  for (let i = 0, j = points.length - 1; i < points.length; j = i++) {
+    const xi = points[i].x, yi = points[i].y, xj = points[j].x, yj = points[j].y;
+    if (((yi > y) !== (yj > y)) && (x < (xj - xi) * (y - yi) / (yj - yi) + xi)) inside = !inside;
+  }
+  return inside;
+}
+// 5e rule: difficult terrain doesn't stack — MAX multiplier among every non-blocking zone
+// containing the point, not a sum or product. Mirrors server.js exactly.
+function costMultiplierAt(x, y, zones) {
+  let mult = 1;
+  for (const z of zones) {
+    const info = ZONE_KINDS[z.kind];
+    if (!info || info.blocksMovement || info.costMultiplier <= mult) continue;
+    if (pointInPolygon(x, y, z.points)) mult = info.costMultiplier;
+  }
+  return mult;
+}
+// Parametric segment-vs-segment intersection bounded to both segments (t, s both in [0,1]) —
+// mirrors server.js's segmentIntersectionT.
+function segmentIntersectionT(x1, y1, x2, y2, p3, p4) {
+  const d1x = x2 - x1, d1y = y2 - y1;
+  const d2x = p4.x - p3.x, d2y = p4.y - p3.y;
+  const denom = d1x * d2y - d1y * d2x;
+  if (Math.abs(denom) < 1e-10) return null; // parallel
+  const t = ((p3.x - x1) * d2y - (p3.y - y1) * d2x) / denom;
+  const s = ((p3.x - x1) * d1y - (p3.y - y1) * d1x) / denom;
+  if (t >= 0 && t <= 1 && s >= 0 && s <= 1) return t;
+  return null;
+}
+// Same algorithm as server.js's traceCostAlongPath (see there for the full explanation) —
+// returns { wx, wy, costUsed } instead of { x, y, costUsed } purely to match this file's own
+// wx/wy convention for world coordinates, matched by callers here. Walks a straight drag path,
+// charging costMultiplier-weighted distance against `budget`, and returns where the pin
+// actually ends up (which may be short of the requested destination) plus the exact cost spent
+// getting there.
+function traceCostAlongPath(fromX, fromY, toX, toY, zones, budget) {
+  const totalDist = Math.hypot(toX - fromX, toY - fromY);
+  if (totalDist === 0) return { wx: fromX, wy: fromY, costUsed: 0 };
+  const breakpoints = new Set([0, 1]);
+  for (const z of zones) {
+    const info = ZONE_KINDS[z.kind];
+    if (!info || info.blocksMovement || info.costMultiplier === 1) continue;
+    const pts = z.points;
+    for (let i = 0; i < pts.length; i++) {
+      const t = segmentIntersectionT(fromX, fromY, toX, toY, pts[i], pts[(i + 1) % pts.length]);
+      if (t !== null) breakpoints.add(t);
+    }
+  }
+  const sorted = [...breakpoints].sort((a, b) => a - b);
+  let costSoFar = 0;
+  for (let i = 0; i < sorted.length - 1; i++) {
+    const t0 = sorted[i], t1 = sorted[i + 1];
+    const midT = (t0 + t1) / 2;
+    const mult = costMultiplierAt(fromX + (toX - fromX) * midT, fromY + (toY - fromY) * midT, zones);
+    const segDist = totalDist * (t1 - t0);
+    const segCost = segDist * mult;
+    if (costSoFar + segCost > budget) {
+      const partialDist = (budget - costSoFar) / mult;
+      const stopT = t0 + (partialDist / totalDist);
+      return { wx: fromX + (toX - fromX) * stopT, wy: fromY + (toY - fromY) * stopT, costUsed: budget };
+    }
+    costSoFar += segCost;
+  }
+  return { wx: toX, wy: toY, costUsed: costSoFar };
 }
 function remainingSpeed(pin) {
   const m = activeMap();
@@ -1133,14 +1199,16 @@ confirmOk.addEventListener('click', () => closeConfirm(true));
 // ── movement range (shown for the currently-selected pin) ────────────
 function clearRange() { rangeLayer.innerHTML = ''; }
 function drawRange(pin) {
-  const scale = activeMap()?.scale;
+  const m = activeMap();
+  const scale = m?.scale;
   if (!scale || !pin.speed || !showSpeedInfo(pin)) { clearRange(); return; }
   // If this pin is mid-turn and has already used some of its speed, show what's actually
-  // left rather than a fresh full circle — matches the clamp this same drag is about to hit.
+  // left rather than a fresh full shape — matches the clamp this same drag is about to hit.
   const rs = isActiveTurnPin(pin) ? remainingSpeed(pin) : null;
   const r = rs ? rs.remaining : pin.speed * scale;
   const color = pin.type === 'player' ? 'var(--player)' : 'var(--monster)';
-  rangeLayer.innerHTML = `<circle cx="${pin.wx}" cy="${pin.wy}" r="${r}" fill="${color}" fill-opacity="0.18" stroke="${color}" stroke-opacity="0.55" stroke-width="2"/>`;
+  const pts = reachablePolygonPoints(pin.wx, pin.wy, r, m.zones || []);
+  rangeLayer.innerHTML = `<polygon points="${pts}" fill="${color}" fill-opacity="0.18" stroke="${color}" stroke-opacity="0.55" stroke-width="2"/>`;
 }
 
 // ── attack range (shown alongside movement range for the selected pin) ─
@@ -1197,6 +1265,26 @@ function castVisibility(ox, oy, radius, zones, doors, steps) {
 }
 function visibilityPolygonPoints(ox, oy, radius, zones, doors = [], steps = 144) {
   return castVisibility(ox, oy, radius, zones, doors, steps).points;
+}
+// The movement-range indicator used to be a plain circle of radius = budget, which was exactly
+// right back when every foot of terrain cost the same foot of speed — once difficult
+// terrain/water cost double, "how far can I go" stops being a circle: it bulges further in
+// open ground and pulls in wherever a ray from the pin crosses costly terrain. Only movement
+// cost is considered here, not solid-zone blocking — the underlying movePin clamp only ever
+// evaluates a straight drag path (there's no pathfinding around a wall in this app), so this
+// deliberately mirrors that: it's "how far a straight line in this direction gets you before
+// the budget runs out", exactly what a real drag in that direction would be clamped to. Reuses
+// traceCostAlongPath per ray rather than a separate stepped walk, so a future change to the
+// cost math (e.g. actual per-zone stacking rules) only has to be right in one place.
+function reachablePolygonPoints(ox, oy, budget, zones, steps = 144) {
+  const points = [];
+  for (let i = 0; i < steps; i++) {
+    const angle = (i / steps) * Math.PI * 2;
+    const farX = ox + Math.cos(angle) * budget, farY = oy + Math.sin(angle) * budget;
+    const { wx, wy } = traceCostAlongPath(ox, oy, farX, farY, zones, budget);
+    points.push(`${wx},${wy}`);
+  }
+  return points.join(' ');
 }
 function clearAttackRange() { attackRangeLayer.innerHTML = ''; }
 function drawAttackRange(pin) {
@@ -1476,15 +1564,18 @@ function renderTurnOrder() {
   wasMyTurn = isMyPlayerTurn;
 
   // Persistent dashed range indicator for a solo active entry (skipped for grouped entries
-  // to avoid overlapping circles) — distinct from the solid transient one used on click/drag.
-  // Anchored to the pin's LIVE position and shrunk to the remaining budget, so it visibly
-  // contracts (and recenters) after each move rather than staying fixed for the whole turn.
+  // to avoid overlapping shapes) — distinct from the solid transient one used on click/drag.
+  // Anchored to the pin's LIVE position and shrunk to the remaining budget (a lumpy shape
+  // once difficult terrain/water are in play, same reachablePolygonPoints reasoning as
+  // drawRange), so it visibly contracts (and recenters) after each move rather than staying
+  // fixed for the whole turn.
   if (entry && entry.pinIds.length === 1) {
     const pin = pins.find(p => p.id === entry.pinIds[0]);
     const r = pin && showSpeedInfo(pin) && remainingSpeed(pin);
     if (pin && r && r.remaining > 0) {
       const color = pin.type === 'player' ? 'var(--player)' : 'var(--monster)';
-      turnRangeLayer.innerHTML = `<circle cx="${pin.wx}" cy="${pin.wy}" r="${r.remaining}" fill="${color}" fill-opacity="0.12" stroke="${color}" stroke-opacity="0.45" stroke-dasharray="4 3" stroke-width="2"/>`;
+      const pts = reachablePolygonPoints(pin.wx, pin.wy, r.remaining, m?.zones || []);
+      turnRangeLayer.innerHTML = `<polygon points="${pts}" fill="${color}" fill-opacity="0.12" stroke="${color}" stroke-opacity="0.45" stroke-dasharray="4 3" stroke-width="2"/>`;
       return;
     }
   }
@@ -1866,6 +1957,11 @@ function renderPin(pin) {
     drawRange(pin); // shown locked at the starting position for the whole drag, as a reference for how far the pin can move
     drawAttackRange(pin); // this one follows the pin instead — see onMove — since it's about where you end up, not where you started
     let moved = false;
+    // clampToSpeed's costUsed, from the latest call — cost-weighted (difficult terrain/water
+    // charge more budget per foot actually covered), not the raw distance the pin visibly
+    // moved, so this is what actually has to be added to traveled on drop, not a fresh
+    // Math.hypot of the net displacement.
+    let lastCostUsed = 0;
     const onMove = (e2) => {
       const dx = e2.clientX - startX, dy = e2.clientY - startY;
       if (Math.abs(dx) + Math.abs(dy) > 4) moved = true;
@@ -1879,6 +1975,7 @@ function renderPin(pin) {
       if (myRole === 'dm' || !pathBlocked(dragAnchor.wx, dragAnchor.wy, raw.wx, raw.wy)) {
         pin.wx = raw.wx;
         pin.wy = raw.wy;
+        lastCostUsed = raw.costUsed;
       }
       el.style.left = pin.wx + 'px';
       el.style.top = pin.wy + 'px';
@@ -1894,8 +1991,7 @@ function renderPin(pin) {
         clearAttackRange();
         const m = activeMap();
         if (myRole === 'player' && m?.initiative && isActiveTurnPin(pin)) {
-          const segDist = Math.hypot(pin.wx - origWx, pin.wy - origWy);
-          m.initiative.traveled[pin.id] = (m.initiative.traveled[pin.id] || 0) + segDist;
+          m.initiative.traveled[pin.id] = (m.initiative.traveled[pin.id] || 0) + lastCostUsed;
           renderTurnOrder();
         }
         sendAction({ type: 'movePin', mapId: state.activeMapId, pinId: pin.id, wx: pin.wx, wy: pin.wy });
