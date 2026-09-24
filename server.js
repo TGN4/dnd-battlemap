@@ -238,7 +238,7 @@ app.get('/api/maps/:id/export', requireBasicAuth, (req, res) => {
     version: 1,
     exportedAt: new Date().toISOString(),
     map: {
-      name: map.name, scale: map.scale, pins: map.pins, zones: map.zones,
+      name: map.name, scale: map.scale, fogEdgeFt: map.fogEdgeFt, fogFeatherFt: map.fogFeatherFt, pins: map.pins, zones: map.zones,
       doors: map.doors, templates: map.templates, initiative: map.initiative,
     },
     characters,
@@ -313,7 +313,7 @@ app.post('/api/maps/import', requireBasicAuth, express.json({ limit: '150mb' }),
   const name = (body.map.name ? `${body.map.name} (imported)` : 'Imported map').toString().trim().slice(0, 80) || 'Imported map';
   Object.assign(state.characters, characters);
   state.maps[mapId] = {
-    id: mapId, name, file: `${mapId}.pdf`, scale: body.map.scale ?? null,
+    id: mapId, name, file: `${mapId}.pdf`, scale: body.map.scale ?? null, fogEdgeFt: body.map.fogEdgeFt, fogFeatherFt: body.map.fogFeatherFt,
     pins, zones, doors, templates, initiative,
   };
   state.activeMapId = mapId;
@@ -714,6 +714,26 @@ function handleMessage(conn, msg) {
       } else {
         Object.assign(pin, patch);
       }
+      break;
+    }
+    // How thick the lit border along a visible solid's edge is in a player's fog of war, in feet
+    // (DM-tunable per map; players read it from state to render their own fog).
+    case 'setFogEdge': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      const ft = Number(msg.feet);
+      if (!map || !Number.isFinite(ft)) return;
+      map.fogEdgeFt = Math.min(10, Math.max(0.25, ft));
+      break;
+    }
+    // How soft the fade from lit to fogged is at the edge of a player's vision, in feet
+    // (0 = hard cutout). DM-tunable per map, like fogEdgeFt above.
+    case 'setFogFeather': {
+      if (conn.role !== 'dm') return;
+      const map = state.maps[msg.mapId];
+      const ft = Number(msg.feet);
+      if (!map || !Number.isFinite(ft)) return;
+      map.fogFeatherFt = Math.min(6, Math.max(0, ft));
       break;
     }
     case 'setScale': {

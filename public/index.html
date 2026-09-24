@@ -69,6 +69,8 @@
   body.player-mode #btnExportMap,
   body.player-mode #btnImportMap,
   body.player-mode #btnDeleteMap,
+  body.player-mode #fogEdgeControl,
+  body.player-mode #fogFeatherControl,
   body.player-mode #btnSetScale,
   body.player-mode #btnAddPlayer,
   body.player-mode #btnAddMonster,
@@ -89,6 +91,9 @@
 
   #mapSelect { max-width: 160px; }
   #btnDeleteMap { padding: 7px 10px; }
+  .fog-edge { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); }
+  .fog-edge input { width: 80px; }
+  .fog-edge span { min-width: 34px; }
 
   #status { color: var(--muted); font-size: 12px; margin-left: auto; white-space: nowrap; }
 
@@ -467,6 +472,12 @@
   <input type="file" id="mapImportFileInput" accept="application/json,.json" hidden>
   <button id="btnImportMap" title="Import a previously-exported map file">Import map</button>
   <button id="btnDeleteMap" disabled title="Delete this map">🗑</button>
+  <label id="fogEdgeControl" class="fog-edge" title="How thick the lit edge of a visible solid is in players' fog of war">Lit edge
+    <input type="range" id="fogEdgeRange" min="0.5" max="5" step="0.25" value="1.5"><span id="fogEdgeValue">1.5 ft</span>
+  </label>
+  <label id="fogFeatherControl" class="fog-edge" title="How soft the fade from lit to fog is at the edge of players' vision">Fog fade
+    <input type="range" id="fogFeatherRange" min="0" max="4" step="0.25" value="1"><span id="fogFeatherValue">1 ft</span>
+  </label>
   <div class="sep"></div>
   <button id="btnSetScale" disabled>Set scale</button>
   <button id="btnPan" disabled>Move</button>
@@ -701,6 +712,10 @@ const btnExportMap = document.getElementById('btnExportMap');
 const btnImportMap = document.getElementById('btnImportMap');
 const mapImportFileInput = document.getElementById('mapImportFileInput');
 const btnDeleteMap= document.getElementById('btnDeleteMap');
+const fogEdgeRange = document.getElementById('fogEdgeRange');
+const fogEdgeValue = document.getElementById('fogEdgeValue');
+const fogFeatherRange = document.getElementById('fogFeatherRange');
+const fogFeatherValue = document.getElementById('fogFeatherValue');
 const btnSetScale = document.getElementById('btnSetScale');
 const btnPan      = document.getElementById('btnPan');
 const btnAddPlayer= document.getElementById('btnAddPlayer');
@@ -1356,6 +1371,7 @@ function rayIntersectsSegment(ox, oy, dx, dy, e1, e2) {
 function castVisibility(ox, oy, radius, zones, doors, steps) {
   const points = [];
   const hitZones = new Set();
+  const rayHits = []; // per ray: { zone, x, y } where it stopped on a blocksLOS zone, else null
   for (let i = 0; i < steps; i++) {
     const angle = (i / steps) * Math.PI * 2;
     const dx = Math.cos(angle), dy = Math.sin(angle);
@@ -1375,9 +1391,10 @@ function castVisibility(ox, oy, radius, zones, doors, steps) {
       if (t !== null && t < dist) { dist = t; hitZone = null; } // a door isn't a zone to highlight this way
     }
     if (hitZone) hitZones.add(hitZone);
+    rayHits.push(hitZone ? { zone: hitZone, x: ox + dx * dist, y: oy + dy * dist } : null);
     points.push(`${ox + dx * dist},${oy + dy * dist}`);
   }
-  return { points: points.join(' '), hitZones };
+  return { points: points.join(' '), hitZones, rayHits };
 }
 function visibilityPolygonPoints(ox, oy, radius, zones, doors = [], steps = 144) {
   return castVisibility(ox, oy, radius, zones, doors, steps).points;
@@ -1436,87 +1453,31 @@ function drawAttackRange(pin) {
 // existing "visible to everyone" reasoning, paint AFTER fog instead, so a door or a spell
 // marker stays visible even sitting in unlit territory, the same way solid-zone geometry has
 // never been treated as secret — only creatures/tokens are meant to disappear into the dark.
+const DEFAULT_FOG_FEATHER_FT = 1; // softness of the lit-to-fog fade at the vision boundary, in feet (DM-configurable per map)
+const DEFAULT_FOG_EDGE_FT = 1.5; // thickness of the lit border on a visible solid, in feet (DM-configurable per map)
 const FOG_RADIUS = 100000; // far past any realistic map extent — geometry is the only limit
-// DMs building an organic-looking feature (a bush, a rock pile) out of overlapping pieces —
-// or, now that zones are polygons, still might for a quick multi-piece sketch — place several
-// overlapping/adjacent zones together (16 legacy obstacle rectangles on the real campaign map
-// turned out to be 6 such clusters of 2-3 plus 3 singles, before the migration to zones).
-// From one specific viewing angle, one piece of a cluster can fully eclipse another piece
-// directly behind it, so a per-zone "was this one hit by a ray" check only reveals whatever
-// sliver happens to face the viewer — not "the whole tree", which is what it actually looks
-// like standing next to it. So blocksLOS zones are grouped once here, and revealing any single
-// piece of a cluster reveals every piece in it.
-//
-// Clustering has to be by actual shape proximity, not bounding-box proximity: an early version
-// used "bounding boxes overlap or sit within a small pad," which merges any two zones whose
-// bounding boxes happen to be close — for organic blob-shaped polygons (a tree canopy, say)
-// the box can extend well past the visible shape, so two entirely separate trees a few
-// squares apart got merged into one reveal-cluster, defeating normal occlusion between them
-// (Thomas: trees a DM placed as separate obstacles were staying fully lit even when a nearer
-// tree should have been blocking sight to them — see the screenshot this was fixed from).
-// zoneBounds is now only a cheap pre-filter to skip the precise check for zones that are
-// obviously far apart; polygonsCloseOrOverlapping does the real, shape-accurate test.
-function zoneBounds(zone) {
-  const xs = zone.points.map(p => p.x), ys = zone.points.map(p => p.y);
-  return { x1: Math.min(...xs), y1: Math.min(...ys), x2: Math.max(...xs), y2: Math.max(...ys) };
-}
-function pointToSegmentDist(px, py, ax, ay, bx, by) {
-  const dx = bx - ax, dy = by - ay;
-  const lenSq = dx * dx + dy * dy;
-  let t = lenSq === 0 ? 0 : ((px - ax) * dx + (py - ay) * dy) / lenSq;
-  t = Math.max(0, Math.min(1, t));
-  return Math.hypot(px - (ax + t * dx), py - (ay + t * dy));
-}
-// True only if the two polygons actually overlap (edges cross, or one fully contains the
-// other) or their nearest edges sit within `pad` of each other — never merely because their
-// bounding boxes are close.
-function polygonsCloseOrOverlapping(a, b, pad) {
-  const ap = a.points, bp = b.points;
-  for (let i = 0; i < ap.length; i++) {
-    const a1 = ap[i], a2 = ap[(i + 1) % ap.length];
-    for (let j = 0; j < bp.length; j++) {
-      if (segmentsIntersect(a1, a2, bp[j], bp[(j + 1) % bp.length])) return true;
+// A solid's lit border: only the edge a viewer actually sees is revealed — the rest of the
+// solid (its interior, and anything behind it) stays fogged, like Roll20's wall lines. The
+// vision polygon already stops exactly at the near face, so this just traces that visible face:
+// consecutive rays that stopped on the same zone are joined into a polyline, which is later
+// stroked into the fog mask as a crisp lit line hugging the solid's silhouette from the viewer.
+function visibleEdgePolylines(rayHits) {
+  const n = rayHits.length;
+  const zoneAt = i => rayHits[(i + n) % n]?.zone || null;
+  let start = 0;
+  for (let i = 0; i < n; i++) if (zoneAt(i) !== zoneAt(i - 1)) { start = i; break; }
+  const lines = [];
+  let cur = null;
+  for (let k = 0; k <= n; k++) {
+    const i = (start + k) % n;
+    const hit = k < n ? rayHits[i] : null;
+    if (hit && cur && cur.zone === hit.zone) cur.pts.push(`${hit.x},${hit.y}`);
+    else {
+      if (cur && cur.pts.length > 1) lines.push(cur.pts.join(' '));
+      cur = hit ? { zone: hit.zone, pts: [`${hit.x},${hit.y}`] } : null;
     }
   }
-  if (pointInPolygon(ap[0].x, ap[0].y, bp) || pointInPolygon(bp[0].x, bp[0].y, ap)) return true;
-  let minDist = Infinity;
-  for (const v of ap) {
-    for (let j = 0; j < bp.length; j++) {
-      const b1 = bp[j], b2 = bp[(j + 1) % bp.length];
-      minDist = Math.min(minDist, pointToSegmentDist(v.x, v.y, b1.x, b1.y, b2.x, b2.y));
-    }
-  }
-  for (const v of bp) {
-    for (let i = 0; i < ap.length; i++) {
-      const a1 = ap[i], a2 = ap[(i + 1) % ap.length];
-      minDist = Math.min(minDist, pointToSegmentDist(v.x, v.y, a1.x, a1.y, a2.x, a2.y));
-    }
-  }
-  return minDist <= pad;
-}
-function clusterZones(zones) {
-  const PAD = 20; // world px — small gap a DM might have left between pieces of one feature
-  const bounds = new Map(zones.map(z => [z, zoneBounds(z)]));
-  const mightBeClose = (a, b) => {
-    const ba = bounds.get(a), bb = bounds.get(b);
-    return !(ba.x2 + PAD < bb.x1 || bb.x2 + PAD < ba.x1 || ba.y2 + PAD < bb.y1 || bb.y2 + PAD < ba.y1);
-  };
-  const overlapsOrTouches = (a, b) => mightBeClose(a, b) && polygonsCloseOrOverlapping(a, b, PAD);
-  const clusterOf = new Map(); // zone -> array (its full cluster, itself included)
-  const visited = new Set();
-  zones.forEach(z => {
-    if (visited.has(z)) return;
-    const cluster = [z];
-    visited.add(z);
-    for (let i = 0; i < cluster.length; i++) {
-      zones.forEach(z2 => {
-        if (visited.has(z2)) return;
-        if (overlapsOrTouches(cluster[i], z2)) { cluster.push(z2); visited.add(z2); }
-      });
-    }
-    cluster.forEach(member => clusterOf.set(member, cluster));
-  });
-  return clusterOf;
+  return lines;
 }
 function renderFog() {
   if (myRole !== 'player' || !mapCanvas.width || !mapCanvas.height) { fogLayer.innerHTML = ''; return; }
@@ -1526,39 +1487,32 @@ function renderFog() {
   const doors = m.doors || [];
   const w = mapCanvas.width, h = mapCanvas.height;
   const playerPins = pins.filter(p => p.type === 'player');
-  const losBlockers = zones.filter(z => ZONE_KINDS[z.kind]?.blocksLOS);
-  const clusterOf = clusterZones(losBlockers);
   // Each player pin punches its own hole in the mask; a map with no player pins placed yet
   // (or none of them still there) renders fully dark, which is the correct "no vision" state.
-  // The ray-casting shadow stops exactly at a blocking zone's NEAR face — correct for what's
-  // BEHIND it, but that leaves the zone's own footprint (the tree itself, right next to you)
-  // sitting just outside the lit polygon and getting darkened, which looks wrong up close: you
-  // can see the tree you're standing next to, just not what's past it. So every zone that
-  // castVisibility actually stopped a ray on (collected from the very same ray-cast that draws
-  // the shadow, not a separate check that could disagree with it) — and, per the clustering
-  // above, everything else grouped with it — gets its own full footprint punched as a hole too.
-  // Difficult terrain never appears here since it never blocks LOS in the first place — being
-  // covered by fog when out of current vision (unlike doors/templates) is exactly what should
-  // happen to it, so it needs no special-casing at all, just normal token-layer treatment.
-  const visibleZones = new Set();
+  // The lit hole stops at a solid's near face, so its interior stays fogged; only the face the
+  // party can actually see gets a crisp lit border stroked on top (see visibleEdgePolylines).
+  const edgeLines = [];
   const holes = playerPins
     .map(p => {
-      const { points, hitZones } = castVisibility(p.wx, p.wy, FOG_RADIUS, zones, doors, 144);
-      hitZones.forEach(z => (clusterOf.get(z) || [z]).forEach(x => visibleZones.add(x)));
+      const { points, rayHits } = castVisibility(p.wx, p.wy, FOG_RADIUS, zones, doors, 144);
+      edgeLines.push(...visibleEdgePolylines(rayHits));
       return `<polygon points="${points}" fill="black"/>`;
     })
     .join('');
-  const visibleZoneHoles = [...visibleZones]
-    .map(z => `<polygon points="${z.points.map(p => `${p.x},${p.y}`).join(' ')}" fill="black"/>`)
+  const edgeW = Math.max(6, (m.scale || 20) * (m.fogEdgeFt ?? DEFAULT_FOG_EDGE_FT));
+  const edgeStrokes = edgeLines
+    .map(pts => `<polyline points="${pts}" fill="none" stroke="black" stroke-width="${edgeW}" stroke-linejoin="round" stroke-linecap="round"/>`)
     .join('');
-  // A soft feather on every fog edge (the vision boundary and the zone cutouts alike) reads
-  // less like a hard vector cutout and more like actual fading visibility — one blur on the
-  // whole mask covers both at once.
-  const blur = Math.max(6, (m.scale || 20) * 0.5);
+  // Roll20-style look: the vision boundary gets the DM's "fog fade" feather, and the lit solid
+  // edges get their own smaller blur (proportional to the edge width) so they fall off into the
+  // fogged interior as a gradient instead of a hard band. Fog is fairly light (0.62) so the map
+  // stays readable.
+  const blur = (m.scale || 20) * (m.fogFeatherFt ?? DEFAULT_FOG_FEATHER_FT); // wider = a softer gradient from lit to fog; 0 = hard cutout
   fogLayer.innerHTML = `
     <filter id="fogBlur" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="${blur}"/></filter>
-    <mask id="fogMask"><g filter="url(#fogBlur)"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}${visibleZoneHoles}</g></mask>
-    <rect x="0" y="0" width="${w}" height="${h}" fill="#05060a" fill-opacity="0.92" mask="url(#fogMask)"/>
+    <filter id="fogEdgeBlur" filterUnits="userSpaceOnUse" x="0" y="0" width="${w}" height="${h}"><feGaussianBlur stdDeviation="${edgeW * 0.35}"/></filter>
+    <mask id="fogMask"><g filter="url(#fogBlur)"><rect x="0" y="0" width="${w}" height="${h}" fill="white"/>${holes}</g><g filter="url(#fogEdgeBlur)">${edgeStrokes}</g></mask>
+    <rect x="0" y="0" width="${w}" height="${h}" fill="#05060a" fill-opacity="0.62" mask="url(#fogMask)"/>
   `;
 }
 
@@ -2005,6 +1959,14 @@ function updateToolbarState() {
   btnResetView.disabled = !hasScale;
   btnDeleteMap.disabled = !hasMap;
   btnExportMap.disabled = !hasMap;
+  fogEdgeRange.disabled = !hasMap;
+  const edgeFt = m?.fogEdgeFt ?? DEFAULT_FOG_EDGE_FT;
+  fogEdgeRange.value = edgeFt;
+  fogEdgeValue.textContent = `${edgeFt} ft`;
+  fogFeatherRange.disabled = !hasMap;
+  const featherFt = m?.fogFeatherFt ?? DEFAULT_FOG_FEATHER_FT;
+  fogFeatherRange.value = featherFt;
+  fogFeatherValue.textContent = `${featherFt} ft`;
   btnInitiative.disabled = !hasScale;
 }
 
@@ -2810,6 +2772,28 @@ mapImportFileInput.addEventListener('change', async () => {
     showToast(err.message || "Import failed — is that a valid exported map file?");
     setMode(mode); // restore the hint text that "Importing map…" overwrote
   }
+});
+
+fogEdgeRange.addEventListener('input', () => {
+  const m = activeMap();
+  if (!m) return;
+  const feet = parseFloat(fogEdgeRange.value);
+  m.fogEdgeFt = feet;
+  fogEdgeValue.textContent = `${feet} ft`;
+});
+fogFeatherRange.addEventListener('input', () => {
+  const m = activeMap();
+  if (!m) return;
+  m.fogFeatherFt = parseFloat(fogFeatherRange.value);
+  fogFeatherValue.textContent = `${m.fogFeatherFt} ft`;
+});
+fogFeatherRange.addEventListener('change', () => {
+  const m = activeMap();
+  if (m) sendAction({ type: 'setFogFeather', mapId: m.id, feet: m.fogFeatherFt });
+});
+fogEdgeRange.addEventListener('change', () => {
+  const m = activeMap();
+  if (m) sendAction({ type: 'setFogEdge', mapId: m.id, feet: m.fogEdgeFt });
 });
 
 btnDeleteMap.addEventListener('click', async () => {
